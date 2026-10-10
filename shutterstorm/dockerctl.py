@@ -91,6 +91,8 @@ class DockerCtl:
             "status": st.get("Status"),
             "health": (st.get("Health") or {}).get("Status"),
             "nano_cpus": info.get("HostConfig", {}).get("NanoCpus", 0) or 0,
+            # CFS quota in microseconds per 100 ms period; <= 0 means no limit (-1 and 0 are both "unlimited")
+            "cpu_quota": max(0, info.get("HostConfig", {}).get("CpuQuota", 0) or 0),
             "project": (info.get("Config", {}).get("Labels") or {}).get("com.docker.compose.project"),
         }
 
@@ -137,6 +139,17 @@ class DockerCtl:
         """``docker update --cpus``; ``0`` means unlimited."""
         cpus = f"{nano_cpus / 1e9:g}" if nano_cpus else "0"
         self._act("update", name, "--cpus", cpus)
+
+    def set_cpu_quota(self, name: str, quota_us: int) -> None:
+        """CPU limit as a CFS quota per 100 ms period; ``0`` removes the limit (``--cpu-quota -1``).
+
+        Used instead of ``--cpus`` because ``docker update --cpus 0`` does not remove a limit on
+        Docker 29.8 (API_NOTES #4), which forced a container recreate to undo it.
+        """
+        if quota_us > 0:
+            self._act("update", name, "--cpu-period", "100000", "--cpu-quota", str(int(quota_us)))
+        else:
+            self._act("update", name, "--cpu-quota", "-1")
 
     def logs(self, name: str, tail: int = 80) -> str:
         """Last ``tail`` log lines (stdout + stderr). Read-only, so no scope check needed."""

@@ -168,6 +168,8 @@ class Workflow:
         """What to run next, now, and how safely: the AI planner, or the operator's list."""
         ctx = self.ctx
         if self.use_planner:
+            if step >= self.budget:
+                return None
             self.step(f"AI decides experiment {step + 1} of up to {self.budget}")
             decision = planner.decide_next(ctx, self.llm, self.plan, self.experiments, self.thresholds, self.budget)
         elif step < len(self.specs):

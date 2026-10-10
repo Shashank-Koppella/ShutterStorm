@@ -52,7 +52,7 @@ def test_every_fault_applies_and_undoes(ctx, fault_id):
     assert ctx.journal.is_empty()
     for name in (SERVER, ML, REDIS, POSTGRES):
         c = ctx.sim.containers[name]
-        assert c["running"] and not c["paused"] and c["nano"] == 0
+        assert c["running"] and not c["paused"] and c["nano"] == 0 and c["quota"] == 0
     assert not ctx.sim.netem and not ctx.sim.helpers
 
 
@@ -88,6 +88,6 @@ def test_panic_mid_fault_restores_everything(ctx, checkpoint):
     assert result["journal_left"] == 0
     for name in (SERVER, ML, REDIS, POSTGRES):
         c = ctx.sim.containers[name]
-        assert c["running"] and not c["paused"] and c["nano"] == 0
+        assert c["running"] and not c["paused"] and c["nano"] == 0 and c["quota"] == 0
     with pytest.raises(AbortRun):
         check_stop(ctx)  # panic also stops any running workflow

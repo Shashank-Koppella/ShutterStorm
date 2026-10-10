@@ -133,7 +133,7 @@ def build_recipe(ctx, spec: FaultSpec) -> dict:
     if spec.kind == "restart":
         return {"type": "ensure_running", "container": c}
     if spec.kind == "cpu":
-        return {"type": "set_cpus", "container": c, "nano_cpus": ctx.docker.state(c)["nano_cpus"] or 0}
+        return {"type": "cpu_quota", "container": c, "cpu_quota": ctx.docker.state(c)["cpu_quota"]}
     if spec.kind in NETEM_ARGS:
         return {"type": "netem", "container": c, "helper": NETEM_HELPER, "image": NETEM_IMAGE}
     if spec.kind == "load":
@@ -156,7 +156,7 @@ def apply_fault_action(ctx, spec: FaultSpec, recipe: dict, params: dict | None =
         thread.start()
         return thread
     elif spec.kind == "cpu":
-        d.set_nano_cpus(c, int(float(knob(params, "cpu")) * 1e9))
+        d.set_cpu_quota(c, int(float(knob(params, "cpu")) * 100_000))
     elif spec.kind in NETEM_ARGS:
         if not d.image_present(NETEM_IMAGE):
             raise FaultError(f"{spec.id} needs the {NETEM_IMAGE} image: run `docker pull {NETEM_IMAGE}` first")
@@ -187,7 +187,9 @@ def undo_recipe(ctx, recipe: dict) -> None:
         if not st["running"]:
             d.start(c)
         d.wait_healthy(c, t.healthy_timeout_s, t.poll_s)
-    elif kind == "set_cpus":
+    elif kind == "cpu_quota":
+        d.set_cpu_quota(c, int(recipe["cpu_quota"]))
+    elif kind == "set_cpus":  # journal entries written by older versions
         _restore_cpus(ctx, c, int(recipe["nano_cpus"]))
     elif kind == "netem":
         _remove_netem(ctx, recipe)
@@ -211,6 +213,9 @@ def verify_recipe(ctx, recipe: dict) -> tuple[bool, str]:
         ok = d.wait_healthy(c, ctx.settings.timings.healthy_timeout_s, ctx.settings.timings.poll_s)
         st = d.state(c)
         return ok, f"running={st['running']} health={st['health']}"
+    if kind == "cpu_quota":
+        now = d.state(c)["cpu_quota"]
+        return now == int(recipe["cpu_quota"]), f"CpuQuota={now or 'unlimited'} expected={recipe['cpu_quota'] or 'unlimited'}"
     if kind == "set_cpus":
         now = d.state(c)["nano_cpus"] or 0
         return now == int(recipe["nano_cpus"]), f"NanoCpus={now} expected={recipe['nano_cpus']}"

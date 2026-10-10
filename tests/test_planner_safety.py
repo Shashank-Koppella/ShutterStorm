@@ -110,7 +110,7 @@ def test_combo_and_traffic_spike_in_workflow(ctx):
     assert combo["load"]["sent"] > 0 and combo["load"]["workers"] == 24
     assert combo["heatmap"]["J4"] == "hung"
     assert exps["db_cpu_throttle"]["heatmap"]["J2"] in ("ok", "slow")
-    assert not ctx.sim.containers[REDIS]["paused"] and ctx.sim.containers["immich_postgres"]["nano"] == 0
+    assert not ctx.sim.containers[REDIS]["paused"] and ctx.sim.containers["immich_postgres"]["quota"] == 0
     assert data["cleanup"]["ok"]
     assert data["plan"]["source"] == "operator"
 

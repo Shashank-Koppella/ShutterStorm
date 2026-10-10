@@ -87,8 +87,10 @@ def verify_cleanup(ctx, checkpoint: dict, tracker=None) -> dict:
         st = ctx.docker.state(name)
         check(f"{name} running and healthy", healthy, f"health={st['health']}")
         check(f"{name} not paused", not st["paused"], f"paused={st['paused']}")
-        expected = checkpoint["containers"][name]["nano_cpus"]
-        check(f"{name} NanoCpus restored", st["nano_cpus"] == expected, f"{st['nano_cpus']} (expected {expected})")
+        before = checkpoint["containers"][name]
+        want = (before["nano_cpus"], before.get("cpu_quota", 0))
+        now = (st["nano_cpus"], st.get("cpu_quota", 0))
+        check(f"{name} CPU limit restored", now == want, f"NanoCpus/CpuQuota {now} (expected {want})")
     helpers = ctx.docker.list_helpers()
     check("no shutterstorm_* containers", not helpers, ", ".join(helpers) or "none")
     netem = netem_present(ctx)

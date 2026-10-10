@@ -118,6 +118,10 @@ def panic(ctx, reason: str = "manual") -> dict:
     checkpoint = load_last_checkpoint(ctx)
     if checkpoint:
         for name in CORE_CONTAINERS:
+            want_quota = checkpoint["containers"][name].get("cpu_quota", 0)
+            if d.state(name)["cpu_quota"] != want_quota:
+                d.set_cpu_quota(name, want_quota)
+                actions.append(f"restored CpuQuota of {name} to {want_quota or 'unlimited'}")
             want = checkpoint["containers"][name]["nano_cpus"] or 0
             if (d.state(name)["nano_cpus"] or 0) != want:
                 _restore_cpus(ctx, name, want)

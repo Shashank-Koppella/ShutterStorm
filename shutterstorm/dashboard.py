@@ -98,7 +98,9 @@ async function tick(){
  const L=s.latest; if(!L)return;
  let h=`<h2>Latest result: ${esc(L.name)}</h2><div class="row" style="gap:24px;align-items:flex-start"><div><div class="score">${esc(L.score)}</div><div class="muted">resilience / 100</div></div>
   <div class="muted">status ${esc(L.status)} &middot; cleanup ${L.cleanup?pill("PASS","ok"):pill("FAIL","bad")} &middot; <a href="/runs/${encodeURIComponent(L.name)}/report.html" target="_blank">full report</a><br>safety limits: ${esc(L.thresholds)}</div></div>`;
- if(L.plan&&L.plan.items&&L.plan.items.length){h+=`<h3 style="margin:16px 0 6px">Experiment plan <span class="muted">(by ${esc(L.plan.source)})</span></h3><p class="muted">${esc(L.plan.strategy||"")}</p><table><tr><th>#</th><th>experiment</th><th>class</th><th>why</th></tr>`+
+ if(L.decisions&&L.decisions.length){h+=`<h3 style="margin:16px 0 6px">AI decisions: what, when, how safely</h3><table><tr><th>step</th><th>experiment</th><th>by</th><th>plan</th><th>strength / duration</th><th>safety limits</th><th>why</th></tr>`+
+  L.decisions.map(d=>`<tr><td>${d.step}</td><td><b>${esc(d.fault)}</b></td><td>${esc(d.source)}</td><td>${d.followed_plan?"as planned":pill("changed plan","slow")}</td><td>${esc(Object.entries(d.settings).filter(([k])=>!k.startsWith("max_")).map(([k,v])=>k+"="+v).join(", "))}</td><td>${esc(d.safety)}</td><td>${esc(d.reason)}<br><span class="muted">${esc(d.safety_reason)}</span>${d.clamped&&d.clamped.length?`<br><span class="muted">clamped: ${esc(d.clamped.join("; "))}</span>`:""}</td></tr>`).join("")+"</table>"}
+ if(L.plan&&L.plan.items&&L.plan.items.length){h+=`<h3 style="margin:16px 0 6px">Tentative plan <span class="muted">(by ${esc(L.plan.source)})</span></h3><p class="muted">${esc(L.plan.strategy||"")}</p><table><tr><th>#</th><th>experiment</th><th>class</th><th>why</th></tr>`+
   L.plan.items.map(i=>`<tr><td>${i.rank}</td><td><b>${esc(i.fault)}</b></td><td>${esc(i.failure_class)}</td><td>${esc(i.reason)}</td></tr>`).join("")+"</table>"}
  if(L.comparison&&L.comparison.rows&&L.comparison.rows.length){h+=`<h3 style="margin:16px 0 6px">Before / after <span class="muted">(vs ${esc(L.comparison.before_run)})</span></h3><table><tr><th>fault</th><th>before</th><th>after</th><th>delta</th><th>verdict</th></tr>`+
   L.comparison.rows.map(r=>`<tr><td>${esc(r.fault)}</td><td>${r.score_before}</td><td><b>${r.score_after}</b></td><td>${r.delta>0?"+":""}${r.delta}</td><td>${pill(r.verdict,r.verdict==="improved"?"ok":(r.verdict==="regressed"?"bad":"na"))}</td></tr>`).join("")+"</table>"}
@@ -199,7 +201,8 @@ def _latest(runs: list[dict]) -> dict | None:
         return {"name": r["name"], "status": data.get("status"), "score": data.get("overall_score"),
                 "cleanup": (data.get("cleanup") or {}).get("ok"), "experiments": exps,
                 "thresholds": data.get("thresholds"), "comparison": data.get("comparison"),
-                "plan": {"source": plan.get("source"), "strategy": plan.get("strategy"), "items": plan.get("items", [])}}
+                "plan": {"source": plan.get("source"), "strategy": plan.get("strategy"), "items": plan.get("items", [])},
+                "decisions": data.get("decisions", [])}
     return None
 
 

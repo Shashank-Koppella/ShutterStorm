@@ -399,11 +399,12 @@ def decide_next(ctx, llm: LLMClient, the_plan: dict, done_exps: list[dict], caps
         "in progress. Use what was observed so far in this run: dig deeper where something broke unexpectedly or "
         "hung, avoid repeating what is already clear, keep covering failure classes. Decide (1) WHAT: one fault id "
         "from allowed_next (you may change the tentative plan), (2) HOW HARD and HOW LONG: settings within "
-        "settings_bounds (duration_s, and the fault's strength knob if it has one), and (3) HOW SAFELY: "
+        "settings_bounds for that fault (duration_s, plus its strength setting if settings_bounds lists one: cpus, "
+        "workers, delay_ms or loss_pct), and (3) HOW SAFELY: "
         "max_error_rate and max_p95_ms, stricter for risky targets (e.g. the database, or a service that already "
         "hung) and never above their max. Schema: {\"fault\": str, \"reason\": str (one sentence: why this "
         "experiment now, citing what was observed), \"settings\": {\"duration_s\": number, \"max_error_rate\": "
-        "number, \"max_p95_ms\": number, ...strength knob}, \"safety_reason\": str (one sentence: why these "
+        "number, \"max_p95_ms\": number, plus cpus / workers / delay_ms / loss_pct when listed}, \"safety_reason\": str (one sentence: why these "
         "limits and this strength)}")
     allowed = {c["fault"] for c in pool}
     data, source = _ask(llm, instruction, payload, lambda d: check_decision(d, allowed) or grounding_errors(

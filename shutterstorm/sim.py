@@ -102,7 +102,7 @@ class SimWorld:
 
     @staticmethod
     def _container(name: str, project: str = COMPOSE_PROJECT) -> dict:
-        return {"running": True, "paused": False, "nano": 0, "project": project}
+        return {"running": True, "paused": False, "nano": 0, "quota": 0, "project": project}
 
     # ---------------------------------------------------------------- state
     def change(self, fn) -> None:
@@ -154,7 +154,7 @@ class FakeDocker:
         health = {"Status": "healthy"} if c["running"] else None
         return {"Name": "/" + name, "State": {"Running": c["running"], "Paused": c["paused"], "Status": status,
                                               "Health": health},
-                "HostConfig": {"NanoCpus": c["nano"]},
+                "HostConfig": {"NanoCpus": c["nano"], "CpuQuota": c["quota"]},
                 "Config": {"Labels": {"com.docker.compose.project": c["project"]}, "Env": ["TZ=Etc/UTC"]}}
 
     def _dispatch(self, args: list[str]) -> CmdResult:
@@ -187,6 +187,10 @@ class FakeDocker:
             return self._ok(name + "\n")
         if cmd == "update":
             name = args[-1]
+            if "--cpu-quota" in args:
+                quota = int(args[args.index("--cpu-quota") + 1])
+                w.change(lambda: w.containers[name].update(quota=max(0, quota)))
+                return self._ok(name + "\n")
             cpus = float(args[args.index("--cpus") + 1])
             w.change(lambda: w.containers[name].update(nano=int(cpus * 1e9)))
             return self._ok(name + "\n")
@@ -285,7 +289,7 @@ def _make_handler(w: SimWorld):
             if name == POSTGRES:
                 # Queueing in the connection pool under load, slower queries with a CPU limit.
                 delay = min(1.5, 0.03 * max(0, w.inflight - 8))
-                if c["nano"] and c["nano"] < 1e9:
+                if (c["nano"] and c["nano"] < 1e9) or (c["quota"] and c["quota"] < 100_000):
                     delay += 0.25
                 if delay:
                     time.sleep(delay)
@@ -392,7 +396,8 @@ def _make_handler(w: SimWorld):
                 return
             if chosen == ML and w.netem:
                 time.sleep(3.0 if w.netem_mode == "delay" else 1.2)  # loss: TCP retransmissions
-            if w.containers[chosen]["nano"] and w.containers[chosen]["nano"] < 1e9:
+            ml = w.containers[chosen]
+            if (ml["nano"] and ml["nano"] < 1e9) or (ml["quota"] and ml["quota"] < 100_000):
                 time.sleep(0.8)
             items = [self._asset_dto(a) for a in list(w.assets.values())[:3]]
             self._send(200, {"assets": {"items": items, "total": len(items)}})
