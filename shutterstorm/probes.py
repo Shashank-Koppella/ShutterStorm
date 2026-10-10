@@ -23,6 +23,7 @@ import requests
 
 from .config import PROBE_PREFIX, Settings
 from .immich import ImmichClient
+from .journal import replace_atomic
 
 JOURNEYS = {
     "J0": "liveness (ping)",
@@ -122,7 +123,7 @@ class AssetTracker:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"assets": self.assets, "pending_filenames": self.pending}, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        replace_atomic(tmp, self.path)
 
     def add(self, asset_id: str, filename: str) -> None:
         with self._lock:

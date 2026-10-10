@@ -16,6 +16,8 @@ from typing import Any
 
 from .config import SIM_TIMINGS, Settings, redact
 from .dockerctl import DockerCtl
+from .events import NULL as NULL_EVENTS
+from .events import EventLog
 from .immich import ImmichClient
 from .journal import Journal
 
@@ -56,6 +58,7 @@ class Ctx:
     journal: Journal
     console: Console
     sim: Any = None  # SimWorld when simulating
+    events: EventLog = field(default=NULL_EVENTS, repr=False)
     _admin: ImmichClient | None = field(default=None, repr=False)
 
     @property
@@ -64,6 +67,10 @@ class Ctx:
 
     def log(self, msg: str) -> None:
         self.console.info(msg)
+
+    def event(self, type_: str, **data) -> None:
+        """Structured event for the dashboard (``runs/<id>/events.jsonl``); never raises."""
+        self.events.emit(type_, **data)
 
     def admin(self, fresh: bool = False) -> ImmichClient:
         """A logged-in admin client (cached)."""
@@ -88,6 +95,8 @@ class Ctx:
         if self.simulate:
             (run_dir / "SIMULATED.txt").write_text(SIM_BANNER + "\n", encoding="utf-8")
         self.console.log_path = run_dir / "run.log"
+        self.events = EventLog(run_dir / "events.jsonl")
+        self.console.info(f"run folder: {run_dir.name}")
         return run_dir
 
     def close(self) -> None:
