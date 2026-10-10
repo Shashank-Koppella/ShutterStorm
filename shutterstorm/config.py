@@ -42,6 +42,25 @@ class Timings:
     round_interval_s: float = 2.0      # minimum time between probe rounds (limits load)
 
 
+@dataclass(frozen=True)
+class Thresholds:
+    """Impact limits checked after every probe round while a fault is active.
+
+    If one is breached for ``rounds`` consecutive rounds, the fault is rolled back at
+    once (before its window or TTL ends) and the experiment is marked auto-stopped.
+    """
+
+    max_error_rate: float = 0.75   # fraction of failed (error or hung) user calls in a round
+    max_p95_ms: float = 8000.0     # p95 latency of the successful calls in a round
+    blast_radius: bool = True      # a journey that does NOT depend on the faulted service fails
+    rounds: int = 2                # consecutive breached rounds before rolling back
+
+    def describe(self) -> str:
+        return (f"error rate > {self.max_error_rate:.0%}, p95 > {self.max_p95_ms:.0f} ms"
+                + (", or a journey outside the blast radius fails" if self.blast_radius else "")
+                + f", for {self.rounds} consecutive round(s)")
+
+
 SIM_TIMINGS = Timings(
     round_interval_s=0.1,
     baseline_rounds=2,
@@ -73,6 +92,7 @@ class Settings:
     home: Path = field(default_factory=Path.cwd)  # repo root: .shutterstorm/ and runs/ live here
     simulate: bool = False
     timings: Timings = field(default_factory=Timings)
+    thresholds: Thresholds = field(default_factory=Thresholds)
 
     @property
     def state_dir(self) -> Path:
@@ -117,7 +137,7 @@ def load_settings(home: Path | None = None, simulate: bool = False) -> Settings:
     for key in list(values) + [
         "IMMICH_URL", "IMMICH_EMAIL", "IMMICH_PASSWORD", "IMMICH_DIR", "MISTRAL_API_KEY",
         "MISTRAL_MODEL", "LLM_MODE", "MAX_FAULT_SECONDS", "PROBE_TIMEOUT_SECONDS",
-        "LLM_BUDGET",
+        "LLM_BUDGET", "ABORT_ERROR_RATE", "ABORT_P95_MS", "ABORT_ROUNDS", "ABORT_BLAST_RADIUS",
     ]:
         if os.environ.get(key):
             values[key] = os.environ[key]
@@ -139,6 +159,12 @@ def load_settings(home: Path | None = None, simulate: bool = False) -> Settings:
         llm_budget=int(values.get("LLM_BUDGET", 40)),
         home=home,
         simulate=simulate,
+        thresholds=Thresholds(
+            max_error_rate=float(values.get("ABORT_ERROR_RATE", 0.75)),
+            max_p95_ms=float(values.get("ABORT_P95_MS", 8000)),
+            rounds=int(values.get("ABORT_ROUNDS", 2)),
+            blast_radius=values.get("ABORT_BLAST_RADIUS", "on").lower() not in ("0", "off", "false", "no"),
+        ),
     )
     return settings
 

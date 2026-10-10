@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from .dockerctl import DockerError
 
 NETEM_IMAGE = "nicolaka/netshoot"
 NETEM_HELPER = "shutterstorm_netem_ml"
+NETEM_ARGS = {"latency": ["delay", "3000ms"], "loss": ["loss", "30%"]}
+LOAD_WORKERS = 24
 
 SERVICE_OF = {SERVER: "server", ML: "ml", REDIS: "redis", POSTGRES: "database"}
 COMPOSE_SERVICE_OF = {SERVER: "immich-server", ML: "immich-machine-learning", REDIS: "redis", POSTGRES: "database"}
@@ -37,14 +40,28 @@ class FaultSpec:
 
     id: str
     container: str
-    kind: str          # pause | stop | restart | cpu | latency
+    kind: str          # pause | stop | restart | cpu | latency | loss | load | combo
     description: str
     likelihood: float  # used by the severity formula
-    optional: bool = False
+    optional: bool = False  # never picked by the planner (needs an extra image, or riskier)
+    parts: tuple[str, ...] = ()  # combo faults: the atomic faults applied together
 
     @property
     def service(self) -> str:
+        """The service this experiment is about (for a combo: the non-load part)."""
         return SERVICE_OF[self.container]
+
+    @property
+    def services(self) -> tuple[str, ...]:
+        """Every service the fault touches (one, or several for a combo)."""
+        if not self.parts:
+            return (self.service,)
+        return tuple(dict.fromkeys(CATALOG[p].service for p in self.parts))
+
+    @property
+    def atomic(self) -> tuple["FaultSpec", ...]:
+        """The atomic faults to apply: itself, or the parts of a combo."""
+        return tuple(CATALOG[p] for p in self.parts) if self.parts else (self,)
 
 
 CATALOG: dict[str, FaultSpec] = {f.id: f for f in [
@@ -53,12 +70,24 @@ CATALOG: dict[str, FaultSpec] = {f.id: f for f in [
     FaultSpec("redis_pause", REDIS, "pause", "Freeze Redis/Valkey (job queue hung)", 0.5),
     FaultSpec("redis_stop", REDIS, "stop", "Stop Redis/Valkey (job queue down)", 0.5),
     FaultSpec("db_pause", POSTGRES, "pause", "Freeze Postgres (database hung)", 0.5),
-    FaultSpec("db_stop", POSTGRES, "stop", "Stop Postgres gracefully (database down)", 0.5),
-    FaultSpec("server_restart", SERVER, "restart", "Restart the API server", 0.8),
+    FaultSpec("db_stop", POSTGRES, "stop", "Stop Postgres gracefully (database down)", 0.5, optional=True),
+    FaultSpec("db_cpu_throttle", POSTGRES, "cpu", "Limit Postgres to 0.25 CPU (overloaded database)", 0.6),
+    FaultSpec("server_restart", SERVER, "restart", "Restart the API server (container crash)", 0.8),
     FaultSpec("ml_cpu_throttle", ML, "cpu", "Limit ML to 0.25 CPU (overloaded dependency)", 0.6),
+    FaultSpec("traffic_spike", SERVER, "load",
+              f"Sudden traffic spike: {LOAD_WORKERS} concurrent clients browsing and searching", 0.7),
     FaultSpec("ml_latency", ML, "latency", "Add 3000 ms network delay to ML (netem)", 0.6, optional=True),
+    FaultSpec("ml_packet_loss", ML, "loss", "Drop 30% of ML network packets (lossy network, netem)", 0.6,
+              optional=True),
+    # Combined failures: several atomic faults at once, each with its own journal entry and TTL.
+    FaultSpec("spike_ml_down", ML, "combo", "Traffic spike while the ML service is down", 0.4,
+              parts=("traffic_spike", "ml_stop")),
+    FaultSpec("spike_redis_hung", REDIS, "combo", "Traffic spike while Redis is frozen", 0.4,
+              parts=("traffic_spike", "redis_pause")),
 ]}
+# Used with `run --no-plan` (the AI planner chooses otherwise).
 DEFAULT_EXPERIMENTS = ["ml_pause", "ml_stop", "redis_pause", "redis_stop", "db_pause", "server_restart"]
+ATOMIC_FAULTS = [f for f in CATALOG if not CATALOG[f].parts]
 
 
 class FaultError(RuntimeError):
@@ -84,12 +113,16 @@ def build_recipe(ctx, spec: FaultSpec) -> dict:
         return {"type": "ensure_running", "container": c}
     if spec.kind == "cpu":
         return {"type": "set_cpus", "container": c, "nano_cpus": ctx.docker.state(c)["nano_cpus"] or 0}
-    if spec.kind == "latency":
+    if spec.kind in NETEM_ARGS:
         return {"type": "netem", "container": c, "helper": NETEM_HELPER, "image": NETEM_IMAGE}
+    if spec.kind == "load":
+        # The load generator is a thread of the owning process and dies with it, so the
+        # guard and panic have nothing to undo; in-process, undo stops the thread.
+        return {"type": "stop_load", "container": c, "load_id": uuid.uuid4().hex[:8]}
     raise FaultError(f"no recipe for kind {spec.kind}")
 
 
-def apply_fault_action(ctx, spec: FaultSpec) -> threading.Thread | None:
+def apply_fault_action(ctx, spec: FaultSpec, recipe: dict) -> threading.Thread | None:
     """Perform the fault. ``restart`` runs in a background thread so probes can watch it."""
     d = ctx.docker
     c = spec.container
@@ -103,11 +136,17 @@ def apply_fault_action(ctx, spec: FaultSpec) -> threading.Thread | None:
         return thread
     elif spec.kind == "cpu":
         d.set_nano_cpus(c, 250_000_000)
-    elif spec.kind == "latency":
+    elif spec.kind in NETEM_ARGS:
         if not d.image_present(NETEM_IMAGE):
-            raise FaultError(f"ml_latency needs the {NETEM_IMAGE} image: run `docker pull {NETEM_IMAGE}` first")
+            raise FaultError(f"{spec.id} needs the {NETEM_IMAGE} image: run `docker pull {NETEM_IMAGE}` first")
         d.run_helper(NETEM_HELPER, NETEM_IMAGE, c, ["sleep", "600"])
-        d.exec(NETEM_HELPER, ["tc", "qdisc", "add", "dev", "eth0", "root", "netem", "delay", "3000ms"])
+        d.exec(NETEM_HELPER, ["tc", "qdisc", "add", "dev", "eth0", "root", "netem", *NETEM_ARGS[spec.kind]])
+    elif spec.kind == "load":
+        from .load import start_load  # local import avoids a cycle
+
+        start_load(ctx, recipe["load_id"], LOAD_WORKERS)
+    elif spec.kind == "combo":
+        raise FaultError("combo faults are applied part by part with apply_faults()")
     return None
 
 
@@ -131,6 +170,10 @@ def undo_recipe(ctx, recipe: dict) -> None:
         _restore_cpus(ctx, c, int(recipe["nano_cpus"]))
     elif kind == "netem":
         _remove_netem(ctx, recipe)
+    elif kind == "stop_load":
+        from .load import stop_load
+
+        stop_load(recipe["load_id"])
     else:
         raise FaultError(f"unknown recipe type {kind}")
 
@@ -155,6 +198,11 @@ def verify_recipe(ctx, recipe: dict) -> tuple[bool, str]:
             return False, f"helpers still present: {d.list_helpers()}"
         has = netem_present(ctx)
         return has is not True, "no netem qdisc" if has is False else ("netem check skipped" if has is None else "netem still active")
+    if kind == "stop_load":
+        from .load import load_running
+
+        running = load_running(recipe["load_id"])
+        return not running, "load generator still running" if running else "load generator stopped"
     return False, f"unknown recipe type {kind}"
 
 
@@ -248,12 +296,31 @@ def apply_fault(ctx, spec: FaultSpec, ttl_s: float | None = None) -> ActiveFault
     active._timer.start()
     ctx.log(f"APPLY {spec.id}: {spec.description} (TTL {ttl:.0f}s, journal entry {entry_id})")
     try:
-        active.thread = apply_fault_action(ctx, spec)
+        active.thread = apply_fault_action(ctx, spec, recipe)
     except Exception:
         ctx.log(f"apply of {spec.id} failed; undoing immediately")
         undo_fault(ctx, active)
         raise
     return active
+
+
+def apply_faults(ctx, spec: FaultSpec, ttl_s: float | None = None) -> list[ActiveFault]:
+    """Apply a fault, or every part of a combo. If a part fails, the parts already applied are undone."""
+    applied: list[ActiveFault] = []
+    try:
+        for part in spec.atomic:
+            applied.append(apply_fault(ctx, part, ttl_s=ttl_s))
+    except Exception:
+        undo_faults(ctx, applied)
+        raise
+    return applied
+
+
+def undo_faults(ctx, actives: list[ActiveFault], who: str = "main") -> tuple[bool, str]:
+    """Undo several active faults (load first, then reverse order); ok only if every undo was verified."""
+    order = sorted(reversed(actives), key=lambda a: a.spec.kind != "load")
+    results = [(a.spec.id, *undo_fault(ctx, a, who=who)) for a in order]
+    return all(ok for _, ok, _ in results), "; ".join(f"{fid}: {detail}" for fid, _, detail in results)
 
 
 def _ttl_expired(ctx, active: ActiveFault) -> None:

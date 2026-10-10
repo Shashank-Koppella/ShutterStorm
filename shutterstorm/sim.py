@@ -11,6 +11,9 @@ The fake reproduces the manual findings:
 * M-02 ML stopped -> smart search fails fast with a 500
 * M-03 Redis paused -> upload is stored but the response never arrives; no thumbnail until unpause
 
+It also models load (many concurrent requests slow DB-bound calls down), a CPU-limited
+Postgres (slower queries) and netem delay / packet loss on the ML container.
+
 All output from simulation mode is labelled SIMULATED. It is never a real finding.
 """
 from __future__ import annotations
@@ -81,6 +84,9 @@ class SimWorld:
         self.containers["other_team_db"] = self._container("other_team_db", project="someone-else")
         self.helpers: dict[str, dict] = {}
         self.netem = False
+        self.netem_mode = ""  # "delay" or "loss"
+        self.inflight = 0
+        self.inflight_lock = threading.Lock()
         self.system_config = default_system_config()
         self.assets: dict[str, dict] = {}
         self.tokens: set[str] = set()
@@ -204,6 +210,7 @@ class FakeDocker:
             if rest[:2] == ["tc", "qdisc"]:
                 if rest[2] == "add":
                     w.change(lambda: setattr(w, "netem", True))
+                    w.netem_mode = "loss" if "loss" in rest else "delay"
                 elif rest[2] == "del":
                     w.change(lambda: setattr(w, "netem", False))
                     return self._ok()
@@ -275,7 +282,23 @@ def _make_handler(w: SimWorld):
             if not c or not c["running"]:
                 self._send(500, {"message": error})
                 return False
+            if name == POSTGRES:
+                # Queueing in the connection pool under load, slower queries with a CPU limit.
+                delay = min(1.5, 0.03 * max(0, w.inflight - 8))
+                if c["nano"] and c["nano"] < 1e9:
+                    delay += 0.25
+                if delay:
+                    time.sleep(delay)
             return True
+
+        def handle_one_request(self) -> None:
+            with w.inflight_lock:
+                w.inflight += 1
+            try:
+                super().handle_one_request()
+            finally:
+                with w.inflight_lock:
+                    w.inflight -= 1
 
         def _authed(self) -> bool:
             token = self.headers.get("Authorization", "").replace("Bearer ", "")
@@ -368,7 +391,7 @@ def _make_handler(w: SimWorld):
             if not self._gate(chosen, "Failed to search smart (Immich Server Error)"):
                 return
             if chosen == ML and w.netem:
-                time.sleep(3.0)
+                time.sleep(3.0 if w.netem_mode == "delay" else 1.2)  # loss: TCP retransmissions
             if w.containers[chosen]["nano"] and w.containers[chosen]["nano"] < 1e9:
                 time.sleep(0.8)
             items = [self._asset_dto(a) for a in list(w.assets.values())[:3]]

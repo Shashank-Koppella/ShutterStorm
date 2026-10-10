@@ -5,7 +5,8 @@ import pytest
 
 from shutterstorm.config import ML, POSTGRES, REDIS, SERVER
 from shutterstorm.dockerctl import ScopeError
-from shutterstorm.faults import CATALOG, apply_fault, get_fault, undo_fault, FaultError
+from shutterstorm.faults import CATALOG, FaultError, apply_fault, apply_faults, get_fault, undo_faults
+from shutterstorm.load import load_running
 from shutterstorm.guard import entry_is_orphaned, guard_loop
 from shutterstorm.journal import Journal
 from shutterstorm.safety import AbortRun, check_stop, panic
@@ -43,10 +44,11 @@ def test_unknown_fault_is_rejected():
 @pytest.mark.parametrize("fault_id", list(CATALOG))
 def test_every_fault_applies_and_undoes(ctx, fault_id):
     spec = CATALOG[fault_id]
-    active = apply_fault(ctx, spec)
-    assert len(ctx.journal.entries()) == 1               # write-ahead entry exists while active
-    ok, detail = undo_fault(ctx, active)
+    actives = apply_faults(ctx, spec)
+    assert len(ctx.journal.entries()) == len(spec.atomic)  # one write-ahead entry per applied part
+    ok, detail = undo_faults(ctx, actives)
     assert ok, detail
+    assert not load_running(actives[0].recipe.get("load_id", "-"))
     assert ctx.journal.is_empty()
     for name in (SERVER, ML, REDIS, POSTGRES):
         c = ctx.sim.containers[name]

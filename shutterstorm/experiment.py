@@ -1,7 +1,9 @@
-"""One chaos experiment: inject -> observe -> undo -> recovery -> integrity.
+"""One chaos experiment: inject -> observe (with the safety monitor) -> undo -> recovery -> integrity.
 
 This is pure deterministic code (no LLM). It is used by ``inject`` (Day-1
-demo) and by the full workflow.
+demo) and by the full workflow. A combo fault applies all its parts together.
+After every probe round the :class:`~shutterstorm.safety.SafetyMonitor` checks the
+impact thresholds; a breach rolls the fault back at once (``auto_stopped``).
 """
 from __future__ import annotations
 
@@ -11,37 +13,42 @@ from pathlib import Path
 
 import requests
 
-from .config import SERVER, redact
+from .config import SERVER, Thresholds, redact
 from .context import write_json
-from .faults import FaultSpec, apply_fault, undo_fault
+from .faults import FaultSpec, apply_faults, undo_faults
+from .load import load_stats
 from .probes import Prober, ProbeResult, summarize
 from .reporting_io import append_probes_csv
-from .safety import AbortRun, check_stop
+from .safety import AbortRun, SafetyMonitor, check_stop
 
 OBSERVED = ("J0", "J1", "J2", "J3", "J4", "J5", "J6")
 RECOVERY_JOURNEYS = ("J0", "J1", "J2", "J3", "J4")
 
 
 def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: str | None = None,
-                   window_s: float | None = None, on_round=None) -> dict:
+                   window_s: float | None = None, on_round=None, thresholds: Thresholds | None = None) -> dict:
     """Run one fault experiment and return all evidence as a dict."""
     t = ctx.settings.timings
     label = label or spec.id
     ev_dir = run_dir / "evidence" / label
     prober.experiment = label
     window = min(window_s or t.fault_window_s, ctx.settings.max_fault_seconds - 5)
+    monitor = SafetyMonitor(thresholds or ctx.settings.thresholds, spec)
     check_stop(ctx)
 
     queues_before = prober.queue_snapshot()
-    active = apply_fault(ctx, spec, ttl_s=ctx.settings.max_fault_seconds)
+    actives = apply_faults(ctx, spec, ttl_s=ctx.settings.max_fault_seconds)
     fault_results: list[ProbeResult] = []
     queue_series: list[dict] = []
     logs: dict[str, str] = {}
+    auto_stop: dict | None = None
+    load: dict | None = None
+    applied_at = time.time()
     try:
         time.sleep(t.settle_s)
         start = time.time()
         round_no = 0
-        while time.time() - start < window and not active.ttl_fired:
+        while time.time() - start < window and not any(a.ttl_fired for a in actives):
             check_stop(ctx)
             round_no += 1
             round_start = time.time()
@@ -50,12 +57,24 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
             queue_series.append({"t": round(time.time() - start, 1), "queues": prober.queue_snapshot()})
             if on_round:
                 on_round("fault", round_no, results)
+            breach = monitor.check(results)
+            if breach:
+                auto_stop = {"reason": breach, "round": round_no, "after_s": round(time.time() - applied_at, 1)}
+                ctx.log(f"SAFETY THRESHOLD BREACHED for {spec.id}: {breach}. Rolling back now "
+                        f"({auto_stop['after_s']}s after injection, window was {window:.0f}s)")
+                break
             time.sleep(max(0.0, t.round_interval_s - (time.time() - round_start)))
-        for name in {spec.container, SERVER}:
+        for name in dict.fromkeys(p.container for p in spec.atomic) | {SERVER: None}:
             logs[name] = redact(ctx.docker.logs(name, tail=80), ctx.settings.secrets())
     finally:
         undo_started = time.time()
-        undo_ok, undo_detail = undo_fault(ctx, active)
+        for a in actives:
+            if a.recipe["type"] == "stop_load":
+                load = load_stats(a.recipe["load_id"])
+        undo_ok, undo_detail = undo_faults(ctx, actives)
+        for a in actives:
+            if a.recipe["type"] == "stop_load":
+                load = load_stats(a.recipe["load_id"]) or load
     if not undo_ok:
         raise AbortRun(f"undo of {spec.id} could not be verified: {undo_detail}")
 
@@ -68,8 +87,15 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
         "fault": spec.id,
         "container": spec.container,
         "service": spec.service,
+        "services": list(spec.services),
+        "parts": [p.id for p in spec.atomic],
         "window_s": window,
-        "ttl_fired": active.ttl_fired,
+        "fault_duration_s": round(undo_started - applied_at, 1),
+        "ttl_fired": any(a.ttl_fired for a in actives),
+        "auto_stopped": auto_stop,
+        "safety": {"thresholds": (thresholds or ctx.settings.thresholds).describe(),
+                   "protected_journeys": monitor.protected, "rounds": monitor.history},
+        "load": load,
         "undo": {"ok": undo_ok, "detail": undo_detail},
         "recovery_s": recovery_s,
         "fault_summary": summarize(fault_results),

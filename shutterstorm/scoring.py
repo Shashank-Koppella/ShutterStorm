@@ -20,7 +20,8 @@ from .probes import FAST_FAIL_SECONDS, percentile
 
 WEIGHTS = {"A": 0.30, "L": 0.15, "C": 0.20, "I": 0.15, "R": 0.10, "B": 0.10}
 CRITICALITY = {"database": 1.0, "server": 1.0, "redis": 0.8, "ml": 0.6}
-LIKELIHOOD = {"pause": 0.5, "stop": 0.5, "restart": 0.8, "cpu": 0.6, "latency": 0.6}
+LIKELIHOOD = {"pause": 0.5, "stop": 0.5, "restart": 0.8, "cpu": 0.6, "latency": 0.6, "loss": 0.6,
+              "load": 0.7, "combo": 0.4}
 RECOVERY_FULL_S = 30.0
 RECOVERY_ZERO_S = 300.0
 
@@ -84,7 +85,7 @@ def score_experiment(evidence: dict, baseline: list[dict], journey_deps: dict[st
         "B": bounded_failure(fault),
     }
     s_e = 100 * sum(WEIGHTS[k] * v for k, v in comps.items())
-    crit = CRITICALITY[evidence["service"]]
+    crit = CRITICALITY[evidence["service"]]  # a combo is scored by the service it is about
     like = LIKELIHOOD[kind]
     severity = (100 - s_e) / 100 * crit * like
     return {

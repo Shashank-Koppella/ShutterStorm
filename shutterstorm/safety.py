@@ -1,4 +1,4 @@
-"""Kill switch (``panic``) and the abort rule.
+"""Kill switch (``panic``), the abort rule and the threshold safety monitor.
 
 ``panic`` is deliberately blunt: it undoes every journal entry, then does a
 generic restore of the whole sandbox against the last checkpoint, whatever
@@ -8,9 +8,11 @@ going stops at its next step.
 from __future__ import annotations
 
 from .checkpoint import load_last_checkpoint
-from .config import CORE_CONTAINERS
-from .faults import NETEM_HELPER, NETEM_IMAGE, _remove_netem, _restore_cpus, undo_entry
-from .probes import AssetTracker
+from .config import CORE_CONTAINERS, Thresholds
+from .faults import NETEM_HELPER, NETEM_IMAGE, FaultSpec, _remove_netem, _restore_cpus, undo_entry
+from .load import stop_all as stop_all_load
+from .probes import AssetTracker, percentile
+from .topology import JOURNEY_DEPS
 
 
 class AbortRun(RuntimeError):
@@ -23,11 +25,67 @@ def check_stop(ctx) -> None:
         raise AbortRun(f"STOP file present ({ctx.journal.stop_path})")
 
 
+def protected_journeys(spec: FaultSpec, journey_deps: dict[str, list[str]] = JOURNEY_DEPS) -> list[str]:
+    """Journeys outside the fault's intended blast radius: they need none of the faulted services.
+
+    A load part of a combo is ignored here (it targets the whole server by design); a fault on
+    the server itself has no protected journeys, because every journey goes through it.
+    """
+    targets = {p.service for p in spec.atomic if p.kind != "load"} or set(spec.services)
+    if "server" in targets:
+        return []
+    return [j for j, deps in journey_deps.items() if not targets & set(deps)]
+
+
+class SafetyMonitor:
+    """Checks every fault-window probe round against :class:`Thresholds`.
+
+    ``check`` returns a breach description once a limit has been exceeded for
+    ``thresholds.rounds`` consecutive rounds; the caller then rolls the fault back.
+    """
+
+    def __init__(self, thresholds: Thresholds, spec: FaultSpec) -> None:
+        self.t = thresholds
+        self.spec = spec
+        self.protected = protected_journeys(spec) if thresholds.blast_radius else []
+        self.streak = 0
+        self.history: list[dict] = []
+
+    def evaluate(self, results) -> list[str]:
+        """Which limits this single round exceeds (no streak logic)."""
+        if not results:
+            return []
+        reasons = []
+        failed = [r for r in results if not r.ok]
+        rate = len(failed) / len(results)
+        if rate > self.t.max_error_rate:
+            reasons.append(f"error rate {rate:.0%} > {self.t.max_error_rate:.0%}")
+        p95 = percentile([r.latency_ms for r in results if r.ok], 95)
+        if p95 is not None and p95 > self.t.max_p95_ms:
+            reasons.append(f"p95 latency {p95:.0f} ms > {self.t.max_p95_ms:.0f} ms")
+        outside = sorted({r.journey for r in failed if r.journey in self.protected})
+        if outside:
+            reasons.append(f"blast radius exceeded: {', '.join(outside)} failed although "
+                           f"{'/'.join(self.spec.services)} is not one of their dependencies")
+        self.history.append({"error_rate": round(rate, 3), "p95_ms": p95, "outside_blast_radius": outside,
+                             "breached": reasons})
+        return reasons
+
+    def check(self, results) -> str | None:
+        reasons = self.evaluate(results)
+        self.streak = self.streak + 1 if reasons else 0
+        if reasons and self.streak >= self.t.rounds:
+            return "; ".join(reasons) + f" (for {self.streak} consecutive round(s))"
+        return None
+
+
 def panic(ctx, reason: str = "manual") -> dict:
     """Undo everything and restore the sandbox. Returns a summary of what was done."""
     ctx.log(f"PANIC ({reason}): stopping run, undoing journal, restoring checkpoint")
     ctx.journal.request_stop()
     actions: list[str] = []
+    if stop_all_load():
+        actions.append("stopped in-process traffic generators")
 
     for entry in ctx.journal.entries():
         ok, detail = undo_entry(ctx, entry, who="panic")

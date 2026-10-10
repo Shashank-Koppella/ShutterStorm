@@ -121,9 +121,21 @@ def to_mermaid(topology: dict) -> str:
     return "\n".join(lines)
 
 
+LOAD_JOURNEYS = ["J2", "J3"]  # the traffic spike replays browse (DB) and smart search (ML)
+
+
 def predict_impact(spec: FaultSpec, topology: dict) -> dict:
     """Deterministic prediction: journeys whose dependencies include the faulted service."""
     deps = topology.get("journey_deps", JOURNEY_DEPS)
+    if spec.parts:
+        parts = [predict_impact(p, topology) for p in spec.atomic]
+        broken = sorted({j for p in parts for j in p["predicted_impacted"]})
+        return {"predicted_impacted": broken, "reason": " + ".join(p["reason"] for p in parts),
+                "source": "dependency map"}
+    if spec.kind == "load":
+        return {"predicted_impacted": LOAD_JOURNEYS,
+                "reason": "the spike replays browse (Postgres) and smart search (ML); those journeys should slow down",
+                "source": "dependency map"}
     if spec.service == "server":
         broken = list(deps)
         reason = "every journey goes through the API server"
