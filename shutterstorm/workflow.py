@@ -177,7 +177,7 @@ class Workflow:
             patch = normalize_patch(proposal.get("patch", {}), image)
             errors = validate_patch(patch, image, ml2_present=ctx.docker.state(ML2)["exists"])
             attempt = {"n": n, "rationale": proposal.get("rationale"), "expected_effect": proposal.get("expected_effect"),
-                       "patch": patch, "diff": describe_patch(patch, config), "source": proposal["source"]}
+                       "proposed": proposal.get("patch"), "patch": patch, "diff": describe_patch(patch, config), "source": proposal["source"]}
             if errors:
                 ctx.log(f"   patch REJECTED by validator: {errors}")
                 attempts.append({**attempt, "result": "rejected", "errors": errors})

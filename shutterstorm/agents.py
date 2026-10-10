@@ -201,7 +201,8 @@ def fallback_repair(exp: dict, attempts: list[dict]) -> dict:
              "patch": _ml_failover_patch(500, 2000),
              "expected_effect": "failover within ~2 s of the fault"},
         ]
-    tried = {json.dumps(a.get("patch"), sort_keys=True) for a in attempts}
+    # Compare against what was *proposed* (the stored "patch" is normalised and would never match).
+    tried = {json.dumps(a.get("proposed"), sort_keys=True) for a in attempts}
     for c in candidates:
         if json.dumps(c["patch"], sort_keys=True) not in tried:
             return c
