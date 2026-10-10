@@ -7,6 +7,7 @@
 | [nicolaka/netshoot](https://github.com/nicolaka/netshoot) | Apache-2.0 | Optional helper image for the `ml_latency` / `ml_packet_loss` faults (`tc netem`). Only pulled if you run them. |
 | [Mistral AI API](https://docs.mistral.ai/) | Mistral terms of service | Chat completions (`ministral-8b-latest` by default) for the Planner, Analyst, Fix Advisor and Reporter agents. Only sandbox evidence is sent (probe results, trimmed container logs, config subsets); secrets and tokens are redacted. Optional: everything works with `LLM_MODE=off`. |
 | [requests](https://github.com/psf/requests) | Apache-2.0 | HTTP client. |
+| [python:3.12-slim](https://hub.docker.com/_/python), [docker:27.3.1-cli](https://hub.docker.com/_/docker) images | PSF / Apache-2.0 | Base images of our agents and controller containers (`deploy/Dockerfile`). Only pulled when you build the containers. |
 | [pytest](https://github.com/pytest-dev/pytest) | MIT | Tests (dev only). |
 | COCO128 images (optional, for `seed`) | CC BY 4.0 (COCO) | Optional test content uploaded into **our own** Immich. Not committed (`datasets/` is gitignored). |
 
