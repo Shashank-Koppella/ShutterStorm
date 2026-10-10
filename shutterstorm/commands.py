@@ -1,6 +1,7 @@
 """Implementations of the CLI commands (kept thin; the logic lives in other modules)."""
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -220,5 +221,96 @@ def cmd_drill(settings: Settings, args: Namespace) -> int:
             AssetTracker(ctx.journal.state_dir / "probe_assets.json").cleanup(ctx.admin(fresh=True))
         ctx.log(f"GUARD DRILL {'PASSED: the guard restored the system' if ok else 'FAILED'}")
         return 0 if ok else 1
+    finally:
+        ctx.close()
+
+
+# ------------------------------------------------------------------------ discover / run / report / list / seed
+def cmd_discover(settings: Settings, args: Namespace) -> int:
+    """Write topology.json + topology.md (Mermaid) for the current sandbox."""
+    from .topology import discover, to_mermaid
+
+    ctx = _ctx(settings)
+    try:
+        run_dir = ctx.new_run_dir("discover")
+        topo = discover(ctx)
+        topo["mermaid"] = to_mermaid(topo)
+        write_json(run_dir / "topology.json", topo)
+        (run_dir / "topology.md").write_text("# Dependency map\n\n```mermaid\n" + topo["mermaid"] + "\n```\n",
+                                             encoding="utf-8")
+        for e in topo["edges"]:
+            print(f"  {e['from']:>8} -> {e['to']:<10} [{e['source']}] {e['label']}")
+        print("Not declared in compose: " + "; ".join(topo["undeclared_dependencies"]))
+        print(f"\n{topo['mermaid']}\n\nsaved {run_dir / 'topology.md'}")
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_run(settings: Settings, args: Namespace) -> int:
+    """Full workflow (see workflow.py)."""
+    from .faults import DEFAULT_EXPERIMENTS
+    from .workflow import Workflow
+
+    experiments = [x.strip() for x in args.experiments.split(",") if x.strip()] or DEFAULT_EXPERIMENTS
+    for fault_id in experiments:
+        get_fault(fault_id)  # reject unknown faults before touching anything
+    ctx = _ctx(settings)
+    try:
+        wf = Workflow(ctx, experiments, repair=args.repair, keep_fix=args.keep_fix)
+        run_dir = wf.run()
+        print(f"\nstatus: {wf.status}   overall score: "
+              f"{json.loads((run_dir / 'findings.json').read_text(encoding='utf-8')).get('overall_score')}")
+        print(f"report: {run_dir / 'report.html'}")
+        return 0 if wf.status == "completed" else 1
+    finally:
+        ctx.close()
+
+
+def cmd_report(settings: Settings, args: Namespace) -> int:
+    from pathlib import Path
+
+    from .report import render_reports
+
+    run_dir = Path(args.run)
+    if not run_dir.exists():
+        run_dir = settings.runs_dir / args.run
+    md, html_path = render_reports(run_dir)
+    print(f"wrote {md}\nwrote {html_path}")
+    return 0
+
+
+def cmd_list(settings: Settings, args: Namespace) -> int:
+    from .faults import CATALOG, DEFAULT_EXPERIMENTS
+    from .repair import KNOBS
+
+    print("Fault catalog (anything else is rejected):")
+    for f in CATALOG.values():
+        default = "default" if f.id in DEFAULT_EXPERIMENTS else ("optional" if f.optional else "")
+        print(f"  {f.id:<16} {f.container:<25} {f.kind:<8} likelihood {f.likelihood}  {default:<8} {f.description}")
+    print("\nAllowed repair knobs (validator is fail-closed):")
+    for part, knobs in KNOBS.items():
+        for name, rule in knobs.items():
+            print(f"  {part}: {name}\n      {rule}")
+    return 0
+
+
+def cmd_seed(settings: Settings, args: Namespace) -> int:
+    """Upload a folder of images as test content (Immich skips duplicates by checksum)."""
+    ctx = _ctx(settings)
+    try:
+        client = ctx.admin()
+        exts = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
+        files = sorted(p for p in args.dir.rglob("*") if p.suffix.lower() in exts)
+        if args.limit:
+            files = files[:args.limit]
+        created = dup = failed = 0
+        for path in files:
+            resp = client.upload(path.read_bytes(), path.name, timeout=60)
+            created += resp.status_code == 201
+            dup += resp.status_code == 200
+            failed += resp.status_code not in (200, 201)
+        ctx.log(f"seeded {args.dir}: {created} new, {dup} duplicates skipped, {failed} failed")
+        return 0 if not failed else 1
     finally:
         ctx.close()

@@ -315,6 +315,11 @@ class Prober:
 
     def j6_integrity(self, asset_id: str, sha1: str, phase: str = "") -> ProbeResult:
         res, resp = self._timed("J6", phase, lambda: self.client().original(asset_id))
+        if resp is not None and resp.status_code == 404:
+            # Known race (docs/API_NOTES.md #6): right after upload the file may be mid-move. Retry once.
+            time.sleep(0.5)
+            res, resp = self._timed("J6", phase, lambda: self.client().original(asset_id))
+            res.error_text = (res.error_text + " " if res.error_text else "") + "(retried after transient 404)"
         if res.ok and resp is not None and hashlib.sha1(resp.content).hexdigest() != sha1:
             res.ok, res.error_text = False, "SHA-1 mismatch between uploaded and downloaded bytes"
         return res
