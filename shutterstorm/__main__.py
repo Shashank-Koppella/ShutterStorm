@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="roll back when more than this fraction of calls fail (default 0.75)")
         p.add_argument("--max-p95-ms", type=float, default=None, help="roll back above this p95 latency (default 8000)")
         p.add_argument("--breach-rounds", type=int, default=None,
-                       help="consecutive breached probe rounds before rolling back (default 2)")
+                       help="consecutive breached probe rounds before rolling back (default 1)")
         p.add_argument("--no-blast-radius", action="store_true", help="do not stop when unrelated journeys fail")
 
     p = add("inject", "inject one fault with TTL + kill switch + safety thresholds")

@@ -53,7 +53,7 @@ class Thresholds:
     max_error_rate: float = 0.75   # fraction of failed (error or hung) user calls in a round
     max_p95_ms: float = 8000.0     # p95 latency of the successful calls in a round
     blast_radius: bool = True      # a journey that does NOT depend on the faulted service fails
-    rounds: int = 2                # consecutive breached rounds before rolling back
+    rounds: int = 1                # consecutive breached rounds before rolling back
 
     def describe(self) -> str:
         return (f"error rate > {self.max_error_rate:.0%}, p95 > {self.max_p95_ms:.0f} ms"
@@ -162,7 +162,7 @@ def load_settings(home: Path | None = None, simulate: bool = False) -> Settings:
         thresholds=Thresholds(
             max_error_rate=float(values.get("ABORT_ERROR_RATE", 0.75)),
             max_p95_ms=float(values.get("ABORT_P95_MS", 8000)),
-            rounds=int(values.get("ABORT_ROUNDS", 2)),
+            rounds=int(values.get("ABORT_ROUNDS", 1)),
             blast_radius=values.get("ABORT_BLAST_RADIUS", "on").lower() not in ("0", "off", "false", "no"),
         ),
     )

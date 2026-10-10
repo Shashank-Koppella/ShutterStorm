@@ -351,10 +351,10 @@ class Prober:
         except requests.RequestException:
             pass
 
-    def queue_snapshot(self) -> dict:
+    def queue_snapshot(self, timeout: float | None = None) -> dict:
         """Waiting/active/failed counts per BullMQ queue (or the error)."""
         try:
-            queues = self.client().queues(timeout=self.timeout)
+            queues = self.client().queues(timeout=min(timeout or self.timeout, self.timeout))
             return {q["name"]: {k: q["statistics"].get(k, 0) for k in ("waiting", "active", "failed", "delayed")}
                     | {"paused": q.get("isPaused", False)} for q in queues}
         except (requests.RequestException, RuntimeError) as exc:

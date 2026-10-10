@@ -23,6 +23,7 @@ from .safety import AbortRun, SafetyMonitor, check_stop
 
 OBSERVED = ("J0", "J1", "J2", "J3", "J4", "J5", "J6")
 RECOVERY_JOURNEYS = ("J0", "J1", "J2", "J3", "J4")
+QUEUE_SNAPSHOT_TIMEOUT_S = 3.0  # GET /queues hangs too when Postgres/Redis is frozen
 
 
 def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: str | None = None,
@@ -54,10 +55,11 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
             round_start = time.time()
             results = prober.run_round("fault", OBSERVED, async_deadline=t.fault_async_deadline_s)
             fault_results += results
-            queue_series.append({"t": round(time.time() - start, 1), "queues": prober.queue_snapshot()})
             if on_round:
                 on_round("fault", round_no, results)
-            breach = monitor.check(results)
+            breach = monitor.check(results)  # before the queue snapshot, which can itself hang
+            queue_series.append({"t": round(time.time() - start, 1),
+                                 "queues": prober.queue_snapshot(timeout=QUEUE_SNAPSHOT_TIMEOUT_S)})
             if breach:
                 auto_stop = {"reason": breach, "round": round_no, "after_s": round(time.time() - applied_at, 1)}
                 ctx.log(f"SAFETY THRESHOLD BREACHED for {spec.id}: {breach}. Rolling back now "
