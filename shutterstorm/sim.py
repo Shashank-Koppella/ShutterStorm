@@ -364,6 +364,10 @@ def _make_handler(w: SimWorld):
                 asset = {"id": str(uuid.uuid4()), "filename": fields.get("filename", b"x.png").decode(),
                          "data": data, "sha1": hashlib.sha1(data).hexdigest(), "thumbhash": None}
                 w.assets[asset["id"]] = asset  # stored *before* the job is queued (M-03 ghost upload)
+                if not w.containers[REDIS]["running"]:
+                    # Observed on the real system (API_NOTES #10): with Redis *stopped* the upload hangs too.
+                    w.wait_until(lambda: w.containers[REDIS]["running"])
+                    return self._send(500, {"message": "Failed to queue jobs"})
                 if not self._gate(REDIS, "Failed to queue jobs"):
                     return
                 return self._send(201, {"id": asset["id"], "status": "created"})

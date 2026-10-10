@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fault", default="ml_pause")
     p = add("report", "regenerate the report of a saved run")
     p.add_argument("--run", required=True, help="run folder name (or path)")
+    p.add_argument("--reanalyze", action="store_true",
+                   help="re-run only the AI explanations on the saved evidence (no Docker/Immich access)")
     add("list", "show the fault catalog and the allowed repair knobs")
     add("stop", "create the STOP file (the running workflow stops at the next step)")
     return parser

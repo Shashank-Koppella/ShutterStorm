@@ -57,6 +57,8 @@ def render_markdown(data: dict) -> str:
     out.append(f"Overall resilience score: **{data.get('overall_score')} / 100**  ")
     out.append(f"LLM mode: `{data.get('llm_mode')}`; sources: {data.get('llm_stats', {})}\n")
     out.append(f"## Executive summary  _(AI: {rep.get('source', 'n/a')})_\n\n{rep.get('executive_summary', '')}\n\n_{PATTERN}_\n")
+    out.append("> AI-written text is checked only for numbers and fault names, not for every statement. "
+               "Scores, ranking, heatmap and repair pass/fail are measured.\n")
 
     out.append("## Ranked findings\n")
     out.append("| # | Finding | Severity | Score | Status | Fix |\n|---|---|---|---|---|---|")
@@ -91,7 +93,8 @@ def render_markdown(data: dict) -> str:
                    f"**actual:** {e['actual_impacted']}")
         r = e.get("repair")
         if r:
-            out.append(f"- **Repair:** {r['status']} after {len(r.get('attempts', []))} attempt(s). {r.get('recommendation', '')}")
+            note = "" if r["status"] == "verified" else " _(AI suggestion, not verified by a test)_"
+            out.append(f"- **Repair:** {r['status']} after {len(r.get('attempts', []))} attempt(s). {r.get('recommendation', '')}{note}")
             for att in r.get("attempts", []):
                 out.append(f"  - attempt {att['n']} ({att.get('source')}): {att.get('result')} "
                            f"{'; '.join(att.get('reasons', []) or att.get('errors', []))}")
@@ -165,7 +168,9 @@ def render_html(data: dict) -> str:
 &middot; sources {_e(data.get('llm_stats', {}))}</div>
 <div class="card hero"><div><div class="score">{_e(data.get('overall_score'))}</div><div class="muted">overall resilience / 100</div></div>
 <div style="flex:1;min-width:260px"><b>Executive summary</b>{badge(rep.get('source'))}<p>{_e(rep.get('executive_summary'))}</p>
-<p class="pattern">{_e(PATTERN)}</p></div></div>"""]
+<p class="pattern">{_e(PATTERN)}</p><p class="muted">AI-written text (badges live/cache) is checked only for
+numbers and fault names, not for every statement. Scores, ranking, heatmap and repair pass/fail are measured, not
+AI-generated.</p></div></div>"""]
 
     parts.append("<h2>Ranked findings</h2><div class='card scroll'><table><tr><th>#</th><th>Finding</th><th>Severity</th>"
                  "<th>S_e</th><th>Evidence</th><th>Fix</th><th>Status</th></tr>")
@@ -212,7 +217,8 @@ def render_html(data: dict) -> str:
                      f"<p><b>Integrity:</b> {_e(integ)}</p>")
         r = e.get("repair")
         if r:
-            parts.append(f"<p><b>Repair loop: {_e(r['status'])}</b>{badge(r.get('source'))} {_e(r.get('recommendation'))}</p>")
+            note = "" if r["status"] == "verified" else " <span class='muted'>(AI suggestion, not verified by a test)</span>"
+            parts.append(f"<p><b>Repair loop: {_e(r['status'])}</b>{badge(r.get('source'))} {_e(r.get('recommendation'))}{note}</p>")
             for att in r.get("attempts", []):
                 why = "; ".join(att.get("reasons", []) or att.get("errors", []))
                 parts.append(f"<p>Attempt {att['n']}{badge(att.get('source'))}: <b>{_e(att.get('result'))}</b> "

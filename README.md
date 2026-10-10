@@ -78,7 +78,7 @@ Every command accepts `--simulate`. It runs against a fake Docker backend and an
 that reproduce M-01..M-03. All output is clearly marked **SIMULATED** and is never a real finding.
 ```bash
 python -m shutterstorm --simulate run --repair
-python -m pytest -q            # 51 tests, all in simulation
+python -m pytest -q            # 53 tests, all in simulation
 ```
 
 ## Configuration (`shutterstorm.env`, gitignored; environment variables override it)

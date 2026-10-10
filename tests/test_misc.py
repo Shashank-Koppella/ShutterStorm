@@ -83,3 +83,28 @@ def test_prediction_scorecard():
     exps = [{"fault": "a", "prediction_check": score_prediction(["J3"], ["J3", "J6"])}]
     sc = prediction_scorecard(exps)
     assert sc["precision"] == 1.0 and sc["recall"] == 0.5 and sc["mismatches"][0]["unexpected_impact"] == ["J6"]
+
+
+def test_grounding_rejects_invented_numbers_and_other_faults():
+    from shutterstorm.agents import grounding_errors
+
+    payload = {"score": 85.12, "recovery_s": 0.6, "sample_errors": ["no response within 10s"], "window_s": 35.0}
+    ok = {"summary": "J3 hung for 10s; score 85.1, recovered in 0.6 s (600 ms) after a 35 s window."}
+    assert grounding_errors(ok, ["summary"], payload, "ml_pause") == []
+    invented = {"summary": "Latency rose to 4321 ms and 73.5% of calls failed."}
+    assert any("4321" in e and "73.5" in e for e in grounding_errors(invented, ["summary"], payload))
+    blamed = {"summary": "J3 later failed because of ml_stop."}
+    assert any("ml_stop" in e for e in grounding_errors(blamed, ["summary"], payload, "ml_pause"))
+
+
+def test_analyst_falls_back_when_llm_hallucinates(tmp_path):
+    from shutterstorm import agents
+
+    llm = _llm(tmp_path, "live", key="k")
+    invented = json.dumps({"summary": "99.97% of 4321 requests failed", "affected_journeys": ["J3"],
+                           "root_cause_hypothesis": "x", "user_visible_symptom": "y", "severity_rationale": "z"})
+    llm._post = lambda messages: invented
+    payload = {"score": 85.1}
+    data, source = llm.complete_json([{"role": "user", "content": "q"}],
+                                     agents._grounded(agents.check_analysis, agents.ANALYSIS_TEXT, payload, "ml_pause"))
+    assert (data, source) == (None, "fallback")

@@ -7,6 +7,7 @@ Every result is tagged with ``source``: ``live``, ``cache`` or ``fallback``.
 from __future__ import annotations
 
 import json
+import re
 
 from .faults import CATALOG, FaultSpec
 from .llm import LLMClient
@@ -20,9 +21,22 @@ SYSTEM = ("You are part of ShutterStorm, a chaos-engineering tool testing a self
 
 
 # ====================================================================== schema checks
+def _as_text(value) -> str:
+    """Small models sometimes return a list or object where we asked for prose; flatten it."""
+    if isinstance(value, list):
+        return "; ".join(_as_text(v) for v in value)
+    if isinstance(value, dict):
+        return "; ".join(f"{k}: {_as_text(v)}" for k, v in value.items())
+    return str(value)
+
+
 def _need(data: dict, fields: dict[str, type]) -> list[str]:
+    """Check required fields. Text fields given as list/object are flattened in place (lenient on
+    prose, strict on structure: lists, patches and journey ids are never coerced)."""
     errors = []
     for name, typ in fields.items():
+        if typ is str and name in data and isinstance(data[name], (list, dict, int, float)):
+            data[name] = _as_text(data[name])
         if name not in data:
             errors.append(f"missing field {name}")
         elif not isinstance(data[name], typ):
@@ -89,6 +103,71 @@ def _ask(llm: LLMClient, instruction: str, payload: dict, check) -> tuple[dict |
     return llm.complete_json(messages, check)
 
 
+# ====================================================================== grounding (anti-hallucination)
+NUMBER_RE = re.compile(r"(?<![A-Za-z_\-./:#])\d+(?:\.\d+)?")
+SMALL_INT_OK = 10  # counts like "1 of 7 journeys" are not worth flagging
+
+
+def evidence_numbers(payload) -> set[float]:
+    """Every number that appears anywhere in the evidence (values and inside strings)."""
+    found: set[float] = set()
+
+    def walk(x) -> None:
+        if isinstance(x, bool):
+            return
+        if isinstance(x, (int, float)):
+            found.add(float(x))
+        elif isinstance(x, str):
+            found.update(float(n) for n in NUMBER_RE.findall(x))
+        elif isinstance(x, dict):
+            for k, v in x.items():
+                walk(k)
+                walk(v)
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                walk(v)
+
+    walk(payload)
+    return found
+
+
+def _grounded_number(x: float, known: set[float]) -> bool:
+    if x <= SMALL_INT_OK and x == int(x):
+        return True
+    for e in known:
+        for cand in (e, e * 1000, e / 1000, e * 100):  # s<->ms, ratio<->percent
+            if abs(cand - x) < 1e-9 or round(cand) == x or round(cand, 1) == x or round(cand, 2) == x:
+                return True
+    return False
+
+
+def grounding_errors(data: dict, text_fields: list[str], payload, own_fault: str | None = None) -> list[str]:
+    """Reject numbers not present in the evidence and mentions of faults that were not active."""
+    known = evidence_numbers(payload)
+    errors = []
+    for field in text_fields:
+        values = data.get(field)
+        texts = values if isinstance(values, list) else [values]
+        for text in texts:
+            if isinstance(text, dict):
+                text = " ".join(str(v) for v in text.values())
+            if not isinstance(text, str):
+                continue
+            bad = sorted({n for n in NUMBER_RE.findall(text) if not _grounded_number(float(n), known)})
+            if bad:
+                errors.append(f"{field} cites numbers not in the evidence: {', '.join(bad[:6])}")
+            if own_fault:
+                others = sorted(f for f in CATALOG if f != own_fault and re.search(rf"\b{f}\b", text))
+                if others:
+                    errors.append(f"{field} mentions faults that were not active in this experiment: {others}")
+    return errors
+
+
+def _grounded(check, text_fields: list[str], payload, own_fault: str | None = None):
+    """Combine a schema check with the grounding check."""
+    return lambda d: check(d) or grounding_errors(d, text_fields, payload, own_fault)
+
+
 # ====================================================================== Analyst
 ROOT_CAUSES = {
     ("ml", "pause"): "The server calls the ML service over HTTP and waits without a short timeout. A frozen ML "
@@ -124,6 +203,9 @@ def predict(llm: LLMClient, spec: FaultSpec, topology: dict, deterministic: dict
             "deterministic": deterministic["predicted_impacted"], "source": source}
 
 
+ANALYSIS_TEXT = ["summary", "root_cause_hypothesis", "user_visible_symptom", "severity_rationale"]
+
+
 def analyze(llm: LLMClient, exp: dict, topology: dict) -> dict:
     """Explain one experiment. Output schema per the README."""
     payload = {"dependency_edges": [e for e in topology["edges"] if e["source"] != "empirical"],
@@ -136,8 +218,9 @@ def analyze(llm: LLMClient, exp: dict, topology: dict) -> dict:
                         "str (what you would have predicted before injection), \"summary\": str (2-3 sentences), "
                         "\"affected_journeys\": [ids], \"root_cause_hypothesis\": str, \"user_visible_symptom\": str "
                         "(what a user of the web app would notice, 1 sentence), \"severity_rationale\": str}. "
-                        "Pay special attention to the difference between hung and fast failures.",
-                        payload, check_analysis)
+                        "Pay special attention to the difference between hung and fast failures. Only cite numbers "
+                        "that appear in the evidence; do not name libraries or products that are not in the evidence.",
+                        payload, _grounded(check_analysis, ANALYSIS_TEXT, payload, exp["fault"]))
     if data is None:
         return {**fallback_analysis(exp), "source": "fallback"}
     return {**data, "source": source}
@@ -225,7 +308,10 @@ def propose_repair(llm: LLMClient, exp: dict, current_values: dict, attempts: li
                         "\"patch\": {\"system_config\": {nested partial config}, \"compose_override\": {\"services\": "
                         "{...}}}, \"expected_effect\": str} OR {\"no_fix_possible\": true, \"recommendation\": str "
                         "(a concrete code-level fix)}. For the second ML service you only need to give "
-                        "{\"services\": {\"immich-machine-learning-2\": {}}}; fixed fields are filled in.",
+                        "{\"services\": {\"immich-machine-learning-2\": {}}}; fixed fields are filled in. Example of a "
+                        "valid answer: {\"rationale\": \"one sentence\", \"patch\": {\"system_config\": "
+                        "{\"job\": {\"thumbnailGeneration\": {\"concurrency\": 2}}}}, \"expected_effect\": "
+                        "\"one sentence\"}. rationale and expected_effect must be plain strings.",
                         payload, check_repair)
     if data is None:
         return {**fallback_repair(exp, attempts), "source": "fallback"}
@@ -247,7 +333,8 @@ def write_report(llm: LLMClient, experiments: list[dict], overall: float | None,
                         "pattern 'a hung dependency is handled much worse than a down one' if the evidence shows it. "
                         "Schema: {\"executive_summary\": str, \"ranked_findings\": [{\"id\": str, \"title\": str, "
                         "\"severity\": str, \"evidence\": str, \"fix\": str, \"status\": str}], "
-                        "\"recommendations\": [str]}", payload, check_report)
+                        "\"recommendations\": [str]}. Only cite numbers that appear in the evidence.", payload,
+                        _grounded(check_report, ["executive_summary", "ranked_findings"], payload))
     if data is None:
         data, source = fallback_report(items, overall), "fallback"
     by_id = {f.get("id"): f for f in data["ranked_findings"] if isinstance(f, dict)}

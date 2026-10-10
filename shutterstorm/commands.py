@@ -275,9 +275,41 @@ def cmd_report(settings: Settings, args: Namespace) -> int:
     run_dir = Path(args.run)
     if not run_dir.exists():
         run_dir = settings.runs_dir / args.run
+    if args.reanalyze:
+        reanalyze(settings, run_dir)
     md, html_path = render_reports(run_dir)
     print(f"wrote {md}\nwrote {html_path}")
     return 0
+
+
+def reanalyze(settings: Settings, run_dir) -> None:
+    """Re-run only the AI text (Analyst + Reporter) on a run's saved evidence.
+
+    Touches neither Docker nor Immich. Measurements, scores, heatmaps and repair results are
+    kept exactly as recorded; only the explanations are regenerated (with the grounding check).
+    """
+    from . import agents
+    from .context import Console
+    from .llm import LLMClient
+    from .report import MANUAL_FINDINGS
+    from .scoring import overall_score
+    from .topology import prediction_scorecard
+
+    console = Console(settings.secrets())
+    path = run_dir / "findings.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    llm = LLMClient(settings, console.info)
+    full = []
+    for exp in data["experiments"]:
+        evidence = json.loads((run_dir / "evidence" / exp["label"] / "evidence.json").read_text(encoding="utf-8"))
+        merged = {**exp, **{k: evidence[k] for k in ("fault_results", "recovery_results", "log_tails") if k in evidence}}
+        exp["analysis"] = agents.analyze(llm, merged, data["topology"])
+        console.info(f"{exp['label']}: analysis source {exp['analysis']['source']}")
+        full.append({**merged, "analysis": exp["analysis"]})
+    data["report"] = agents.write_report(llm, full, overall_score(full), prediction_scorecard(full), MANUAL_FINDINGS)
+    data["llm_stats"] = {**llm.stats, "api_calls": llm.calls, "reanalyzed": True}
+    console.info(f"report source {data['report']['source']}; LLM stats {data['llm_stats']}")
+    path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 
 def cmd_list(settings: Settings, args: Namespace) -> int:

@@ -186,7 +186,15 @@ class DockerCtl:
 
     # ---------------------------------------------------------------- waiting
     def wait_healthy(self, name: str, timeout: float = 180, poll: float = 1.0) -> bool:
-        """Wait until running, not paused and healthy (or no healthcheck)."""
+        """Wait until running, not paused and healthy (or no healthcheck).
+
+        The wait is at least one healthcheck interval + 30 s: Immich's Postgres image checks only
+        every 300 s, so after a pause it stays "unhealthy" for up to 5 minutes (API_NOTES #11).
+        """
+        info = self.inspect(name) or {}
+        interval_s = ((info.get("Config", {}).get("Healthcheck") or {}).get("Interval") or 0) / 1e9
+        if interval_s:
+            timeout = max(timeout, interval_s + 30)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             st = self.state(name)
