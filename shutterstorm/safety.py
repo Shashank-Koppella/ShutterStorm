@@ -48,6 +48,10 @@ class SafetyMonitor:
         self.t = thresholds
         self.spec = spec
         self.protected = protected_journeys(spec) if thresholds.blast_radius else []
+        # A restart is one action that cannot be rolled back: stopping early would only cut the
+        # observation short. Its breaches are recorded; the outage is bounded by the restart itself
+        # and by the liveness abort rule after the undo.
+        self.can_roll_back = all(p.kind != "restart" for p in spec.atomic)
         self.streak = 0
         self.history: list[dict] = []
 
@@ -74,7 +78,7 @@ class SafetyMonitor:
     def check(self, results) -> str | None:
         reasons = self.evaluate(results)
         self.streak = self.streak + 1 if reasons else 0
-        if reasons and self.streak >= self.t.rounds:
+        if reasons and self.streak >= self.t.rounds and self.can_roll_back:
             return "; ".join(reasons) + f" (for {self.streak} consecutive round(s))"
         return None
 

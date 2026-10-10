@@ -72,6 +72,12 @@ def test_monitor_needs_consecutive_breaches():
     assert "error rate 80%" in m.check(bad)
 
 
+def test_restart_breaches_are_recorded_but_not_rolled_back():
+    m = SafetyMonitor(Thresholds(rounds=1), CATALOG["server_restart"])
+    assert m.check([res(j, ok=False) for j in ("J0", "J1", "J2")]) is None
+    assert m.history[0]["breached"]
+
+
 def test_monitor_latency_and_blast_radius():
     m = SafetyMonitor(Thresholds(max_p95_ms=1000, rounds=1), CATALOG["ml_cpu_throttle"])
     assert "p95 latency" in m.check([res("J3", latency=5000)])
