@@ -17,9 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .config import COMPOSE_PROJECT, CORE_CONTAINERS, HELPER_PREFIX, ML2
+from .config import COMPOSE_PROJECT, CORE_CONTAINERS, HELPER_PREFIX
 
-SCOPED_NAMES = set(CORE_CONTAINERS) | {ML2}
+SCOPED_NAMES = set(CORE_CONTAINERS)
 HELPER_LABEL = "shutterstorm.helper=true"
 
 

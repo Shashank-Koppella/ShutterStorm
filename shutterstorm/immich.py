@@ -6,7 +6,6 @@ timeout (hung dependency) apart from a fast error.
 """
 from __future__ import annotations
 
-import copy
 from datetime import datetime, timezone
 from typing import Any
 
@@ -101,26 +100,3 @@ class ImmichClient:
         if resp.status_code != 200:
             raise ImmichError(f"GET /system-config: HTTP {resp.status_code}")
         return resp.json()
-
-    def put_system_config(self, config: dict) -> dict:
-        """PUT the *whole* config object (Immich requires the full AdminConfigDto)."""
-        resp = self.request("PUT", "/system-config", json=config)
-        if resp.status_code not in (200, 201):
-            raise ImmichError(f"PUT /system-config: HTTP {resp.status_code}: {resp.text[:300]}")
-        return resp.json()
-
-    def patch_system_config(self, partial: dict) -> dict:
-        """GET the config, deep-merge ``partial`` into it and PUT the whole object."""
-        merged = deep_merge(self.get_system_config(), partial)
-        return self.put_system_config(merged)
-
-
-def deep_merge(base: dict, partial: dict) -> dict:
-    """Return a copy of ``base`` with ``partial`` merged in (dicts recursively, others replaced)."""
-    result = copy.deepcopy(base)
-    for key, value in partial.items():
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = deep_merge(result[key], value)
-        else:
-            result[key] = copy.deepcopy(value)
-    return result

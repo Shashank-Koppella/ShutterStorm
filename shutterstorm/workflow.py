@@ -1,17 +1,19 @@
-"""The workflow state machine (the team's agreed design).
+"""The workflow state machine.
 
     check environment, scope, clean checkpoint
+      -> discover dependency map
       -> baseline tests
-      -> for each approved fault:
-           predict -> inject -> confirm failure + capture evidence -> analyse
-           [--repair] agent proposes patch -> validate -> apply -> changed-files check
-                      -> protected tests -> SAME fault re-injected
-                      -> pass: save verified patch | fail + retries left: feed back | exhausted: unresolved
+      -> for each fault:
+           predict -> inject (journal + TTL + guard) -> observe -> undo + verify
+           -> recovery + integrity -> score (math) -> explain (Analyst)
+           -> suggest a fix (Fix Advisor) -> check the suggestion against the allowed settings
       -> restore test environment + verify cleanup   (always: also on error, STOP, Ctrl+C)
       -> report
 
-Control flow, injection, validation, retries and cleanup are deterministic code.
-LLMs are used only in agents.predict/analyze/propose_repair/write_report.
+ShutterStorm only injects faults and undoes them. It never applies a fix: suggestions are
+shown in the CLI and in the report for a human to decide on. Control flow, injection, undo,
+scoring and cleanup are deterministic code; LLMs are used only in agents.predict / analyze /
+suggest_fix / write_report.
 """
 from __future__ import annotations
 
@@ -20,28 +22,19 @@ import traceback
 from pathlib import Path
 
 from . import agents
-from .approval import Approver, build_request
-from .checkpoint import changed_files, hash_dir, preflight_problems, take_checkpoint, verify_cleanup
-from .config import ML2, OVERRIDE_FILE
+from .checkpoint import preflight_problems, take_checkpoint, verify_cleanup
 from .context import Ctx, write_json
 from .experiment import run_experiment
 from .faults import FaultSpec, get_fault, undo_entry
+from .fixes import describe_patch, manual_steps, ml_image, normalize_patch, validate_patch
 from .llm import LLMClient
-from .probes import ALL_JOURNEYS, PROTECTED_JOURNEYS, AssetTracker, Prober, summarize
+from .probes import ALL_JOURNEYS, AssetTracker, Prober, ProbeResult, summarize
 from .report import MANUAL_FINDINGS, render_reports
 from .reporting_io import append_probes_csv, summary_table
-from .repair import (apply_patch, describe_patch, forget_patch, ml_image, normalize_patch, revert_patch,
-                     validate_patch)
 from .safety import AbortRun, check_stop, panic
 from .scoring import classify_cell, overall_score, score_experiment
 from .topology import (JOURNEY_DEPS, add_empirical_edges, discover, predict_impact, prediction_scorecard,
                        score_prediction, to_mermaid)
-
-CELL_RANK = {"hung": 0, "fast-fail": 1, "slow": 2, "ok": 3, "n/a": 3}
-MIN_SCORE_GAIN = 10.0
-class OperatorQuit(AbortRun):
-    """The operator answered 'q' at an approval prompt."""
-
 
 RAW_KEYS = ("fault_results", "recovery_results")
 
@@ -49,14 +42,10 @@ RAW_KEYS = ("fault_results", "recovery_results")
 class Workflow:
     """Runs the full chaos workflow once and writes everything into ``runs/<id>/``."""
 
-    def __init__(self, ctx: Ctx, experiments: list[str], repair: bool = False, keep_fix: bool = False,
-                 approver: Approver | None = None) -> None:
+    def __init__(self, ctx: Ctx, experiments: list[str], suggest: bool = True) -> None:
         self.ctx = ctx
         self.specs: list[FaultSpec] = [get_fault(f) for f in experiments]  # rejects unknown faults up front
-        self.repair = repair
-        self.keep_fix = keep_fix
-        # Repair patches need approval: "ask" prompts the operator, "yes" (--yes) auto-approves.
-        self.approver = approver or Approver("ask", out=ctx.log)
+        self.suggest = suggest
         self.llm = LLMClient(ctx.settings, ctx.log)
         self.run_dir: Path | None = None
         self.prober: Prober | None = None
@@ -67,6 +56,7 @@ class Workflow:
         self.status = "running"
         self.error = ""
         self.steps: list[dict] = []
+        self.cleanup: dict = {}
 
     # ---------------------------------------------------------------- helpers
     def step(self, name: str) -> None:
@@ -112,15 +102,11 @@ class Workflow:
 
             for spec in self.specs:
                 exp = self.run_one(spec)
-                self.experiments.append(exp)  # recorded even if the repair loop is quit/aborted
-                if self.repair and exp["actual_impacted"]:
-                    exp["repair"] = self.repair_loop(spec, exp)
+                self.experiments.append(exp)
+                if self.suggest and exp["actual_impacted"]:
+                    exp["suggestion"] = self.suggest_fix(spec, exp)
                 self._save_findings()
             self.status = "completed"
-        except OperatorQuit as exc:
-            # Nothing is applied while the prompt waits, so a normal cleanup is enough (no panic).
-            self.status, self.error = "stopped by operator", str(exc)
-            ctx.log(f"STOPPED: {exc}")
         except AbortRun as exc:
             self.status, self.error = "aborted", str(exc)
             ctx.log(f"ABORTED: {exc}")
@@ -138,15 +124,14 @@ class Workflow:
         return self.run_dir
 
     # ---------------------------------------------------------------- one experiment
-    def run_one(self, spec: FaultSpec, label: str | None = None) -> dict:
-        label = label or spec.id
-        self.step(f"Inject approved fault: {label}")
+    def run_one(self, spec: FaultSpec) -> dict:
+        self.step(f"Inject approved fault: {spec.id}")
         deterministic = predict_impact(spec, self.topology)
         prediction = agents.predict(self.llm, spec, self.topology, deterministic)
         self.ctx.log(f"   predicted impact ({prediction['source']}): {prediction['predicted_impacted']}")
-        ev = run_experiment(self.ctx, self.prober, spec, self.run_dir, label=label, on_round=self._on_round)
+        ev = run_experiment(self.ctx, self.prober, spec, self.run_dir, on_round=self._on_round)
         exp = self.build_record(ev, spec, prediction)
-        self.step(f"Confirm failure and capture evidence: {label}")
+        self.step(f"Confirm failure and capture evidence: {spec.id}")
         self.ctx.log(f"   heatmap: {exp['heatmap']}  score {exp['scoring']['score']}  "
                      f"severity {exp['scoring']['severity']} ({exp['scoring']['severity_label']})")
         exp["analysis"] = agents.analyze(self.llm, exp, self.topology)
@@ -170,122 +155,50 @@ class Workflow:
             "baseline_summary": summarize_dicts(self.baseline),
         }
 
-    # ---------------------------------------------------------------- repair loop
-    def repair_loop(self, spec: FaultSpec, exp: dict) -> dict:
+    # ---------------------------------------------------------------- fix suggestion
+    def suggest_fix(self, spec: FaultSpec, exp: dict) -> dict:
+        """Ask the Fix Advisor for one suggestion, check it, print it. Nothing is applied."""
         ctx = self.ctx
-        attempts: list[dict] = []
-        image = ml_image(ctx)
-        for n in range(1, ctx.settings.max_repair_attempts + 1):
-            self.step(f"Agent repairs within allowed scope: {spec.id} attempt {n}")
-            config = ctx.admin(fresh=True).get_system_config()
-            current = {"machineLearning": {k: config["machineLearning"][k] for k in ("urls", "availabilityChecks")},
-                       "job": {q: config["job"][q] for q in config["job"]},
-                       "ml2_running": ctx.docker.state(ML2)["running"]}
-            proposal = agents.propose_repair(self.llm, exp, current, attempts)
-            if proposal.get("no_fix_possible"):
-                ctx.log(f"   repair agent ({proposal['source']}): no config-level fix -> {proposal['recommendation'][:160]}")
-                return {"status": "no_fix_possible", "recommendation": proposal["recommendation"],
-                        "source": proposal["source"], "attempts": attempts}
+        self.step(f"Suggest a fix (not applied): {spec.id}")
+        config = ctx.admin().get_system_config()
+        current = {"machineLearning": {k: config["machineLearning"][k] for k in ("urls", "availabilityChecks")},
+                   "job": {q: config["job"][q] for q in config["job"]}}
+        proposal = agents.suggest_fix(self.llm, exp, current)
+        code_fix = agents.CODE_LEVEL_FIXES.get(spec.service, "")
+        if proposal.get("no_fix_possible"):
+            suggestion = {"kind": "code", "source": proposal["source"], "recommendation": proposal["recommendation"],
+                          "template_code_fix": code_fix, "summary": proposal["recommendation"]}
+        else:
+            image = ml_image(ctx)
             patch = normalize_patch(proposal.get("patch", {}), image)
-            errors = validate_patch(patch, image, ml2_present=ctx.docker.state(ML2)["exists"])
-            attempt = {"n": n, "rationale": proposal.get("rationale"), "expected_effect": proposal.get("expected_effect"),
-                       "proposed": proposal.get("patch"), "patch": patch, "diff": describe_patch(patch, config), "source": proposal["source"]}
-            if errors:
-                ctx.log(f"   patch REJECTED by validator: {errors}")
-                attempts.append({**attempt, "result": "rejected", "errors": errors})
-                continue
-            # Human-in-the-loop: explain the issue and the fix, and ask before touching anything.
-            decision = self.approver.request(build_request(exp, attempt, n, ctx.settings.max_repair_attempts))
-            attempt["approval"] = decision
-            ctx.log(f"   approval: {decision['decision']} (by {decision['by']} at {decision['at']})")
-            if decision["decision"] != "approve":
-                result = {"decline": "declined by operator", "skip": "skipped by operator",
-                          "quit": "operator quit the run", "not_approved": "not approved"}[decision["decision"]]
-                attempts.append({**attempt, "result": result, "reasons": [result]})
-                self._save_findings()
-                if decision["decision"] == "decline":
-                    continue  # the agent sees this in `previous_attempts` and proposes something else
-                if decision["decision"] == "quit":
-                    exp["repair"] = {"status": "operator_quit", "attempts": attempts, "source": proposal["source"],
-                                     "recommendation": agents.CODE_LEVEL_FIXES.get(spec.service, "")}
-                    raise OperatorQuit("operator quit the run at a repair approval prompt")
-                status = "skipped_by_operator" if decision["decision"] == "skip" else "not_approved"
-                return {"status": status, "attempts": attempts, "source": proposal["source"],
-                        "recommendation": agents.CODE_LEVEL_FIXES.get(spec.service, "")}
-            attempt.update(self.test_patch(spec, exp, patch, n))
-            attempts.append(attempt)
-            self._save_findings()
-            if attempt["result"] == "passed":
-                self.step(f"Save verified patch and report: {spec.id}")
-                write_json(self.run_dir / "patches" / f"{spec.id}.json", attempt)
-                (self.run_dir / "patches" / f"{spec.id}.diff").write_text(attempt["diff"] + "\n", encoding="utf-8")
-                return {"status": "verified", "attempts": attempts, "verified_attempt": n,
-                        "recommendation": f"Apply: {proposal.get('rationale', '')}", "source": proposal["source"],
-                        "kept": self.keep_fix}
-            ctx.log(f"   attempt {n} failed: {attempt['reasons']}")
-        self.step(f"Save unresolved result: {spec.id}")
-        return {"status": "unresolved", "attempts": attempts,
-                "recommendation": agents.CODE_LEVEL_FIXES.get(spec.service, ""), "source": "fallback"}
+            errors = validate_patch(patch, image)
+            suggestion = {"kind": "config", "source": proposal["source"], "rationale": proposal.get("rationale"),
+                          "expected_effect": proposal.get("expected_effect"), "patch": patch,
+                          "valid": not errors, "validation_errors": errors, "diff": describe_patch(patch, config),
+                          "manual_steps": manual_steps(patch) if not errors else [],
+                          "template_code_fix": code_fix,
+                          "summary": (proposal.get("rationale") or "") if not errors
+                          else f"(config suggestion rejected: {'; '.join(errors)}) {code_fix}"}
+        suggestion["status"] = "suggestion only: not applied, not tested"
+        self.print_suggestion(spec, exp, suggestion)
+        return suggestion
 
-    def test_patch(self, spec: FaultSpec, exp: dict, patch: dict, n: int) -> dict:
-        """Apply -> changed-files check -> protected tests -> same fault -> compare -> revert."""
-        ctx = self.ctx
-        files_before = hash_dir(Path(ctx.settings.immich_dir))
-        entry_ids: list[str] = []
-        passed = False
-        result: dict = {}
-        try:
-            entry_ids = apply_patch(ctx, patch, f"repair-{spec.id}-{n}")
-            self.step(f"Check changed files and run protected tests: {spec.id} attempt {n}")
-            changed = changed_files(files_before, hash_dir(Path(ctx.settings.immich_dir)))
-            files_ok = all(p == OVERRIDE_FILE for p in changed)
-            self.prober.experiment = f"{spec.id}-repair{n}-protected"
-            protected = []
-            for i in range(ctx.settings.timings.protected_rounds):
-                r = self.prober.run_round("protected", ALL_JOURNEYS, async_deadline=ctx.settings.timings.async_deadline_s)
-                self._on_round("protected", i + 1, r)
-                protected += r
-            append_probes_csv(self.run_dir / "probes.csv", protected)
-            protected_failures = sorted({r.journey for r in protected if r.journey in PROTECTED_JOURNEYS and not r.ok})
-            retest_ev = run_experiment(ctx, self.prober, spec, self.run_dir, label=f"{spec.id}-repair{n}",
-                                       on_round=self._on_round)
-            retest = self.build_record(retest_ev, spec, exp["prediction"])
-            delta = retest["scoring"]["score"] - exp["scoring"]["score"]
-            improved = [j for j in exp["actual_impacted"] if CELL_RANK[retest["heatmap"][j]] > CELL_RANK[exp["heatmap"][j]]]
-            worse = [j for j in ALL_JOURNEYS if CELL_RANK[retest["heatmap"][j]] < CELL_RANK[exp["heatmap"][j]]]
-            reasons = []
-            if not files_ok:
-                reasons.append(f"unexpected file changes in IMMICH_DIR: {changed}")
-            if protected_failures:
-                reasons.append(f"protected journeys regressed: {protected_failures}")
-            if not improved:
-                reasons.append("no target journey improved")
-            if worse:
-                reasons.append(f"journeys got worse: {worse}")
-            if delta < MIN_SCORE_GAIN:
-                reasons.append(f"score gain {delta:+.1f} < {MIN_SCORE_GAIN}")
-            if not retest_ev["undo"]["ok"]:
-                reasons.append("fault undo not verified")
-            passed = not reasons
-            ctx.log(f"   re-test: heatmap {retest['heatmap']} score {retest['scoring']['score']} ({delta:+.1f})")
-            result = {"result": "passed" if passed else "failed", "reasons": reasons, "changed_files": changed,
-                      "protected_failures": protected_failures, "retest_heatmap": retest["heatmap"],
-                      "retest_score": retest["scoring"]["score"], "score_delta": round(delta, 1),
-                      "improved_journeys": improved, "retest_summary": retest["fault_summary"]}
-        except AbortRun:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a failed patch is a failed attempt, not a crash
-            ctx.log(f"   patch application/test failed: {exc}")
-            result = {"result": "failed", "reasons": [f"{exc.__class__.__name__}: {exc}"]}
-        finally:
-            if passed and self.keep_fix:
-                forget_patch(ctx, entry_ids)
-                ctx.log("   --keep-fix: verified patch left applied")
-            elif entry_ids:
-                ok, details = revert_patch(ctx, entry_ids)
-                if not ok:
-                    raise AbortRun(f"patch revert could not be verified: {details}")
-        return result
+    def print_suggestion(self, spec: FaultSpec, exp: dict, s: dict) -> None:
+        """Show the issue and the suggested fix in the CLI."""
+        who = {"live": "AI (live)", "cache": "AI (cached answer)"}.get(s["source"], "template (no AI)")
+        broken = ", ".join(f"{j}={c}" for j, c in exp["heatmap"].items() if c not in ("ok", "n/a"))
+        lines = [f"   ---- SUGGESTED FIX for {spec.id} (not applied, not tested) ----",
+                 f"   issue: {broken}; score {exp['scoring']['score']}, severity {exp['scoring']['severity_label']}",
+                 f"   suggested by: {who}"]
+        if s["kind"] == "config":
+            lines.append(f"   why: {s.get('rationale')}")
+            lines += ["      " + line for line in s["diff"].splitlines()]
+            lines.append("   uses allowed settings only: "
+                         + ("yes" if s["valid"] else "NO - " + "; ".join(s["validation_errors"])))
+        else:
+            lines.append(f"   no config-level fix; recommendation: {s['recommendation']}")
+        lines.append(f"   code-level fix (template): {s['template_code_fix']}")
+        self.ctx.log("\n".join(lines))
 
     # ---------------------------------------------------------------- cleanup + report
     def cleanup_and_report(self) -> None:
@@ -297,8 +210,7 @@ class Workflow:
             for entry in ctx.journal.entries():
                 undo_entry(ctx, entry, who="cleanup")
             if self.checkpoint is not None:
-                cleanup = verify_cleanup(ctx, self.checkpoint, self.prober.tracker if self.prober else None,
-                                         keep_fix=self.keep_fix)
+                cleanup = verify_cleanup(ctx, self.checkpoint, self.prober.tracker if self.prober else None)
         except Exception as exc:  # noqa: BLE001
             cleanup = {"ok": False, "checks": [], "note": f"cleanup error: {exc}"}
         write_json(self.run_dir / "cleanup.json", cleanup)
@@ -327,7 +239,7 @@ class Workflow:
             "started": self.started,
             "finished": time.time(),
             "llm_mode": self.ctx.settings.llm_mode,
-            "repair_enabled": self.repair,
+            "suggestions_enabled": self.suggest,
             "steps": self.steps,
             "baseline_summary": summarize_dicts(self.baseline),
             "topology": self.topology,
@@ -344,14 +256,11 @@ class Workflow:
             data["scorecard"] = prediction_scorecard(self.experiments) if self.experiments else {}
             data["report"] = agents.write_report(self.llm, self.experiments, data["overall_score"],
                                                  data["scorecard"], MANUAL_FINDINGS) if self.experiments else {}
-            data["cleanup"] = getattr(self, "cleanup", {})
+            data["cleanup"] = self.cleanup
             data["llm_stats"] = {**self.llm.stats, "api_calls": self.llm.calls}
         write_json(self.run_dir / "findings.json", data)
 
 
 def summarize_dicts(results: list[dict]) -> dict:
     """``probes.summarize`` for results stored as dicts."""
-    from .probes import ProbeResult
-
     return summarize([ProbeResult(**r) for r in results])
-

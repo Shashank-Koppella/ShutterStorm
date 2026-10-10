@@ -1,25 +1,22 @@
-"""Repair patches: schema, fail-closed validator, apply and revert.
+"""Fix suggestions: schema, fail-closed validator and human-readable rendering.
 
-A patch has two optional parts::
+ShutterStorm never applies a fix. The Fix Advisor (agents.suggest_fix) proposes one, this
+module checks that it only uses known, bounded settings (so a human could apply it safely)
+and renders it as a diff plus manual steps. A suggestion has two optional parts::
 
-    {"system_config": {...partial AdminConfigDto...},
+    {"system_config": {...partial Immich AdminConfigDto...},
      "compose_override": {"services": {...}}}
 
-Only the knobs in :data:`KNOBS` are allowed. Anything else is rejected,
-including unknown keys, out-of-range values and other services. The validator never
-"fixes up" a dangerous patch; it only fills in the fixed, required fields of the
-optional second ML service.
+Only the knobs in :data:`KNOBS` pass validation. A suggestion that fails is still shown,
+labelled with the reasons, so the reader can see why it is not recommended.
 """
 from __future__ import annotations
 
 import copy
 import json
 import re
-from pathlib import Path
 
-from .config import CORE_CONTAINERS, ML2, OVERRIDE_FILE
-from .faults import restore_override, undo_entry
-from .immich import deep_merge
+from .config import ML2, OVERRIDE_FILE
 
 ML_URL_1 = "http://immich-machine-learning:3003"
 ML_URL_2 = "http://immich-machine-learning-2:3003"
@@ -180,6 +177,9 @@ def validate_patch(patch: dict, ml_image: str, ml2_present: bool = False) -> lis
     adds_ml2 = isinstance(co, dict) and ML2_SERVICE in (co.get("services") or {})
     if ML_URL_2 in (urls or []) and not (adds_ml2 or ml2_present):
         errors.append(f"machineLearning.urls uses {ML_URL_2} but the patch does not add {ML2_SERVICE}")
+    if adds_ml2 and ML_URL_2 not in (urls or []):
+        errors.append(f"adds {ML2_SERVICE} but does not list {ML_URL_2} in machineLearning.urls, "
+                      f"so Immich would never use it")
     return errors
 
 
@@ -187,54 +187,6 @@ def ml_image(ctx) -> str:
     """The image of the existing ML service, from the compose config."""
     compose = ctx.docker.compose_config(ctx.settings.immich_dir)
     return compose["services"]["immich-machine-learning"]["image"]
-
-
-# ====================================================================== apply / revert
-def apply_patch(ctx, patch: dict, label: str) -> list[str]:
-    """Apply a validated patch (compose part first). Every change is journaled first."""
-    entry_ids: list[str] = []
-    t = ctx.settings.timings
-    co = patch.get("compose_override")
-    if co:
-        path = Path(ctx.settings.immich_dir) / OVERRIDE_FILE
-        original = path.read_text(encoding="utf-8") if path.exists() else None
-        entry_ids.append(ctx.journal.add("patch", f"{label}:compose_override",
-                                         {"type": "compose_override", "original": original}))
-        merged = deep_merge(json.loads(original) if original else {}, co)
-        # YAML is a superset of JSON, so compose reads this .yml file as-is.
-        path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
-        ctx.log(f"wrote {path.name}; ML-2 needs ~1-2 GB extra RAM" if ML2_SERVICE in co.get("services", {}) else f"wrote {path.name}")
-        ctx.docker.compose(Path(ctx.settings.immich_dir), ["docker-compose.yml", OVERRIDE_FILE], ["up", "-d"])
-        for name in list(CORE_CONTAINERS) + ([ML2] if ML2_SERVICE in co.get("services", {}) else []):
-            if not ctx.docker.wait_healthy(name, t.healthy_timeout_s, t.poll_s):
-                raise RuntimeError(f"{name} did not become healthy after applying the compose patch")
-    sc = patch.get("system_config")
-    if sc:
-        client = ctx.admin(fresh=True)
-        original_config = client.get_system_config()
-        entry_ids.append(ctx.journal.add("patch", f"{label}:system_config",
-                                         {"type": "system_config", "config": original_config}))
-        client.put_system_config(deep_merge(original_config, sc))
-    return entry_ids
-
-
-def revert_patch(ctx, entry_ids: list[str]) -> tuple[bool, list[str]]:
-    """Undo a patch in reverse order. Returns (all verified, details)."""
-    ok_all, details = True, []
-    for entry_id in reversed(entry_ids):
-        entry = ctx.journal.get(entry_id)
-        if entry is None:
-            continue
-        ok, detail = undo_entry(ctx, entry)
-        ok_all &= ok
-        details.append(detail)
-    return ok_all, details
-
-
-def forget_patch(ctx, entry_ids: list[str]) -> None:
-    """--keep-fix: drop the undo entries so cleanup and the guard leave the patch applied."""
-    for entry_id in entry_ids:
-        ctx.journal.remove(entry_id)
 
 
 def describe_patch(patch: dict, current_config: dict | None = None) -> str:
@@ -252,5 +204,16 @@ def describe_patch(patch: dict, current_config: dict | None = None) -> str:
     return "\n".join(lines) or "(empty patch)"
 
 
-__all__ = ["KNOBS", "validate_patch", "normalize_patch", "apply_patch", "revert_patch", "describe_patch",
-           "restore_override"]
+def manual_steps(patch: dict) -> list[str]:
+    """How a human could apply a (valid) suggestion by hand. ShutterStorm never does this itself."""
+    steps = []
+    if patch.get("compose_override"):
+        steps.append(f"Save this as {OVERRIDE_FILE} next to Immich's docker-compose.yml:\n"
+                     + json.dumps(patch["compose_override"], indent=2))
+        steps.append(f"Run in the Immich folder: docker compose -f docker-compose.yml -f {OVERRIDE_FILE} up -d")
+    if patch.get("system_config"):
+        steps.append("Change these values in Immich's admin settings, or merge this JSON into the full config "
+                     "from GET /api/system-config and send it back with PUT /api/system-config:\n"
+                     + json.dumps(patch["system_config"], indent=2))
+    steps.append("Re-run the same experiment (python -m shutterstorm run --experiments <fault>) to measure the effect.")
+    return steps

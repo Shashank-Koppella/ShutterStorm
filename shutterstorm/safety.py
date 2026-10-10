@@ -7,12 +7,9 @@ going stops at its next step.
 """
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 from .checkpoint import load_last_checkpoint
-from .config import CORE_CONTAINERS, ML2, OVERRIDE_FILE
-from .faults import NETEM_HELPER, _remove_netem, _restore_cpus, restore_override, undo_entry, NETEM_IMAGE
+from .config import CORE_CONTAINERS
+from .faults import NETEM_HELPER, NETEM_IMAGE, _remove_netem, _restore_cpus, undo_entry
 from .probes import AssetTracker
 
 
@@ -63,22 +60,10 @@ def panic(ctx, reason: str = "manual") -> dict:
             if (d.state(name)["nano_cpus"] or 0) != want:
                 _restore_cpus(ctx, name, want)
                 actions.append(f"restored NanoCpus of {name} to {want}")
-        override = Path(ctx.settings.immich_dir) / OVERRIDE_FILE
-        content = override.read_text(encoding="utf-8") if override.exists() else None
-        if content != checkpoint["override"] or d.state(ML2)["exists"] != checkpoint["ml2_exists"]:
-            restore_override(ctx, checkpoint["override"])
-            actions.append("restored compose override state")
         for name in CORE_CONTAINERS:
             d.wait_healthy(name, ctx.settings.timings.healthy_timeout_s, ctx.settings.timings.poll_s)
-        try:
-            client = ctx.admin(fresh=True)
-            if json.dumps(client.get_system_config(), sort_keys=True) != json.dumps(checkpoint["system_config"], sort_keys=True):
-                client.put_system_config(checkpoint["system_config"])
-                actions.append("restored system-config")
-        except Exception as exc:  # noqa: BLE001
-            actions.append(f"system-config restore FAILED: {exc}")
     else:
-        actions.append("no checkpoint found: skipped CPU/config/override restore")
+        actions.append("no checkpoint found: skipped CPU-limit restore")
 
     try:
         tracker = AssetTracker(ctx.journal.state_dir / "probe_assets.json")

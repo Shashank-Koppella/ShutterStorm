@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from shutterstorm.config import ML, ML2, POSTGRES, REDIS, SERVER
+from shutterstorm.config import ML, POSTGRES, REDIS, SERVER
 from shutterstorm.dockerctl import ScopeError
 from shutterstorm.faults import CATALOG, apply_fault, get_fault, undo_fault, FaultError
 from shutterstorm.guard import entry_is_orphaned, guard_loop
@@ -89,14 +89,3 @@ def test_panic_mid_fault_restores_everything(ctx, checkpoint):
         assert c["running"] and not c["paused"] and c["nano"] == 0
     with pytest.raises(AbortRun):
         check_stop(ctx)  # panic also stops any running workflow
-
-
-def test_panic_removes_leftover_ml2_and_override(ctx, checkpoint):
-    from shutterstorm.repair import apply_patch, ml_image, normalize_patch
-
-    patch = normalize_patch({"compose_override": {"services": {"immich-machine-learning-2": {}}}}, ml_image(ctx))
-    apply_patch(ctx, patch, "test")
-    assert ML2 in ctx.sim.containers
-    panic(ctx)
-    assert ML2 not in ctx.sim.containers
-    assert not (ctx.settings.immich_dir / "docker-compose.shutterstorm.yml").exists()

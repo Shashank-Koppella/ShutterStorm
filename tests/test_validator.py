@@ -1,6 +1,6 @@
 import pytest
 
-from shutterstorm.repair import ML_URL_1, ML_URL_2, normalize_patch, validate_patch
+from shutterstorm.fixes import ML_URL_1, ML_URL_2, normalize_patch, validate_patch
 
 IMAGE = "ghcr.io/immich-app/immich-machine-learning:v3.3.1"
 
@@ -35,6 +35,7 @@ def test_good_patch_is_accepted():
     ({"compose_override": {"services": {"redis": {"healthcheck": {"test": "curl evil"}}}}}, "no custom test"),
     ({"compose_override": {"services": {"redis": {"cpus": 64}}}}, "0.25..8"),
     ({"compose_override": {"volumes": {"x": {}}}}, "may only contain"),
+    ({"compose_override": {"services": {"immich-machine-learning-2": {}}}}, "would never use it"),
     ({"compose_override": {"services": {"immich-machine-learning-2": {"image": "evil/ml"}}}}, "must be the ML image"),
     ({"compose_override": {"services": {"immich-machine-learning-2": {
         "image": IMAGE, "container_name": "immich_machine_learning_2", "volumes": ["/:/host"],
@@ -46,9 +47,10 @@ def test_bad_patches_are_rejected(patch, fragment):
     assert any(fragment in e for e in errors), errors
 
 
-def test_normalize_drops_unknown_ml2_fields_but_validator_still_sees_top_level():
+def test_normalize_drops_unknown_ml2_fields():
     patch = normalize_patch({"compose_override": {"services": {"immich-machine-learning-2": {
-        "privileged": True, "image": "evil"}}}}, IMAGE)
+        "privileged": True, "image": "evil"}}},
+        "system_config": {"machineLearning": {"urls": [ML_URL_1, ML_URL_2]}}}, IMAGE)
     svc = patch["compose_override"]["services"]["immich-machine-learning-2"]
     assert "privileged" not in svc and svc["image"] == IMAGE
     assert validate_patch(patch, IMAGE) == []

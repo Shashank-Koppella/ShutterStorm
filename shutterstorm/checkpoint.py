@@ -1,9 +1,9 @@
 """Clean-state checkpoint and cleanup verification.
 
-A checkpoint records everything ShutterStorm might change: container states and
-CPU limits, the Immich system-config, the compose override file and a hash of
-every file in IMMICH_DIR (except ``library/``). After a run, every item is
-compared against it and the result goes into the report.
+A checkpoint records container states and CPU limits (which faults change) plus,
+as read-only proof that ShutterStorm never edits Immich, the Immich system-config
+and a hash of every file in IMMICH_DIR (except ``library/``). After a run, every
+item is compared against it and the result goes into the report.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import os
 import time
 from pathlib import Path
 
-from .config import CORE_CONTAINERS, ML2, OVERRIDE_FILE
+from .config import CORE_CONTAINERS
 from .context import write_json
 from .faults import netem_present
 
@@ -38,13 +38,10 @@ def changed_files(before: dict[str, str], after: dict[str, str]) -> list[str]:
 
 def take_checkpoint(ctx, run_dir: Path | None = None) -> dict:
     """Snapshot the current state and store it (run folder + ``last_checkpoint.json``)."""
-    override = Path(ctx.settings.immich_dir) / OVERRIDE_FILE
     checkpoint = {
         "time": time.time(),
         "containers": {name: ctx.docker.state(name) for name in CORE_CONTAINERS},
-        "ml2_exists": ctx.docker.state(ML2)["exists"],
         "system_config": ctx.admin().get_system_config(),
-        "override": override.read_text(encoding="utf-8") if override.exists() else None,
         "files": hash_dir(Path(ctx.settings.immich_dir)),
     }
     write_json(ctx.journal.state_dir / "last_checkpoint.json", checkpoint)
@@ -77,7 +74,7 @@ def preflight_problems(ctx) -> list[str]:
     return problems
 
 
-def verify_cleanup(ctx, checkpoint: dict, tracker=None, keep_fix: bool = False) -> dict:
+def verify_cleanup(ctx, checkpoint: dict, tracker=None) -> dict:
     """Compare the current state with ``checkpoint``. Returns {ok, checks: [...]}."""
     t = ctx.settings.timings
     checks: list[dict] = []
@@ -98,24 +95,13 @@ def verify_cleanup(ctx, checkpoint: dict, tracker=None, keep_fix: bool = False) 
     check("no netem qdisc on ML", netem is not True,
           {True: "netem still active", False: "none", None: "netshoot image absent, ml_latency never ran"}[netem])
 
-    if keep_fix:
-        check("system-config / override", True, "skipped: --keep-fix leaves the verified patch applied")
-    else:
-        try:
-            current = ctx.admin(fresh=True).get_system_config()
-            same = json.dumps(current, sort_keys=True) == json.dumps(checkpoint["system_config"], sort_keys=True)
-            check("system-config equals checkpoint", same, "identical" if same else "differs")
-        except Exception as exc:  # noqa: BLE001
-            check("system-config equals checkpoint", False, f"could not read: {exc}")
-        override = Path(ctx.settings.immich_dir) / OVERRIDE_FILE
-        content = override.read_text(encoding="utf-8") if override.exists() else None
-        check("override file state restored", content == checkpoint["override"],
-              "absent" if content is None else "present")
-        ml2 = ctx.docker.state(ML2)["exists"]
-        check(f"{ML2} state restored", ml2 == checkpoint["ml2_exists"], f"exists={ml2}")
-
-    changed = [p for p in changed_files(checkpoint["files"], hash_dir(Path(ctx.settings.immich_dir)))
-               if not (keep_fix and p == OVERRIDE_FILE)]
+    try:
+        current = ctx.admin(fresh=True).get_system_config()
+        same = json.dumps(current, sort_keys=True) == json.dumps(checkpoint["system_config"], sort_keys=True)
+        check("system-config unchanged", same, "identical" if same else "differs")
+    except Exception as exc:  # noqa: BLE001
+        check("system-config unchanged", False, f"could not read: {exc}")
+    changed = changed_files(checkpoint["files"], hash_dir(Path(ctx.settings.immich_dir)))
     check("IMMICH_DIR files unchanged", not changed, ", ".join(changed) or "no changes")
 
     if tracker is not None:

@@ -33,7 +33,6 @@ JOURNEYS = {
     "J5": "async processing (thumbnail)",
     "J6": "integrity (SHA-1 of original)",
 }
-PROTECTED_JOURNEYS = ("J0", "J1", "J2", "J6")
 ALL_JOURNEYS = tuple(JOURNEYS)
 FAST_FAIL_SECONDS = 5.0
 

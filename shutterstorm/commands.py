@@ -257,12 +257,7 @@ def cmd_run(settings: Settings, args: Namespace) -> int:
         get_fault(fault_id)  # reject unknown faults before touching anything
     ctx = _ctx(settings)
     try:
-        from .approval import Approver
-
-        approver = Approver("yes" if args.yes else "ask", out=ctx.log)
-        if args.repair and not args.yes and not approver.interactive:
-            ctx.log("note: no interactive terminal, so repair patches will be proposed but NOT applied (use --yes)")
-        wf = Workflow(ctx, experiments, repair=args.repair, keep_fix=args.keep_fix, approver=approver)
+        wf = Workflow(ctx, experiments, suggest=not args.no_suggestions)
         run_dir = wf.run()
         print(f"\nstatus: {wf.status}   overall score: "
               f"{json.loads((run_dir / 'findings.json').read_text(encoding='utf-8')).get('overall_score')}")
@@ -290,7 +285,7 @@ def cmd_report(settings: Settings, args: Namespace) -> int:
 def reanalyze(settings: Settings, run_dir) -> None:
     """Re-run only the AI text (Analyst + Reporter) on a run's saved evidence.
 
-    Touches neither Docker nor Immich. Measurements, scores, heatmaps and repair results are
+    Touches neither Docker nor Immich. Measurements, scores, heatmaps and fix suggestions are
     kept exactly as recorded; only the explanations are regenerated (with the grounding check).
     """
     from . import agents
@@ -319,13 +314,13 @@ def reanalyze(settings: Settings, run_dir) -> None:
 
 def cmd_list(settings: Settings, args: Namespace) -> int:
     from .faults import CATALOG, DEFAULT_EXPERIMENTS
-    from .repair import KNOBS
+    from .fixes import KNOBS
 
     print("Fault catalog (anything else is rejected):")
     for f in CATALOG.values():
         default = "default" if f.id in DEFAULT_EXPERIMENTS else ("optional" if f.optional else "")
         print(f"  {f.id:<16} {f.container:<25} {f.kind:<8} likelihood {f.likelihood}  {default:<8} {f.description}")
-    print("\nAllowed repair knobs (validator is fail-closed):")
+    print("\nSettings a fix suggestion may use (anything else is flagged; ShutterStorm never applies fixes):")
     for part, knobs in KNOBS.items():
         for name, rule in knobs.items():
             print(f"  {part}: {name}\n      {rule}")

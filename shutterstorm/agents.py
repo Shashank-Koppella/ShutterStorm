@@ -1,4 +1,4 @@
-"""The three LLM agents (Analyst, Repair, Reporter) and their deterministic fallbacks.
+"""The three LLM agents (Analyst, Fix Advisor, Reporter) and their deterministic fallbacks.
 
 The agents only *explain* and *propose*. They never decide whether a patch
 passed, never rank findings (the scoring math does), and never run commands.
@@ -11,8 +11,8 @@ import re
 
 from .faults import CATALOG, FaultSpec
 from .llm import LLMClient
-from .probes import JOURNEYS, PROTECTED_JOURNEYS
-from .repair import KNOBS, ML2_SERVICE, ML_URL_1, ML_URL_2
+from .probes import JOURNEYS
+from .fixes import KNOBS, ML2_SERVICE, ML_URL_1, ML_URL_2
 
 SYSTEM = ("You are part of ShutterStorm, a chaos-engineering tool testing a self-hosted Immich photo app "
           "(services: immich-server API, immich-machine-learning, Redis/Valkey BullMQ job queue, Postgres) "
@@ -56,7 +56,7 @@ def check_analysis(d: dict) -> list[str]:
                      "user_visible_symptom": str, "severity_rationale": str})
 
 
-def check_repair(d: dict) -> list[str]:
+def check_suggestion(d: dict) -> list[str]:
     if d.get("no_fix_possible") is True:
         return _need(d, {"recommendation": str})
     errors = _need(d, {"rationale": str, "patch": dict, "expected_effect": str})
@@ -251,7 +251,7 @@ def fallback_analysis(exp: dict) -> dict:
     }
 
 
-# ====================================================================== Repair
+# ====================================================================== Fix Advisor
 def _ml_failover_patch(timeout: int, interval: int) -> dict:
     return {
         "compose_override": {"services": {ML2_SERVICE: {
@@ -263,58 +263,45 @@ def _ml_failover_patch(timeout: int, interval: int) -> dict:
 
 
 CODE_LEVEL_FIXES = {
-    "redis": "No config knob bounds this. Code-level fix: put a timeout (e.g. 2-3 s) on BullMQ enqueue calls and "
+    "redis": "No config setting bounds this. Code-level fix: put a timeout (e.g. 2-3 s) on BullMQ enqueue calls and "
              "return the upload response once the file+DB row are committed, queueing jobs asynchronously; show "
              "per-file processing status in the web uploader instead of 'Processed 0/1' forever.",
     "database": "Code-level fix: set a Postgres statement_timeout / pool acquire timeout in the server so requests "
-                "fail fast with a clear 503, and expose DB health in /server/ping-style readiness checks.",
-    "server": "Needs a second API server replica behind a load balancer (outside the allowed knobs), or client-side "
-              "retry with backoff in the web app.",
+                "fail fast with a clear 503, and expose DB health in a readiness check.",
+    "server": "Needs a second API server replica behind a load balancer, or client-side retry with backoff in the "
+              "web app.",
     "ml": "Code-level fix: give the server's ML HTTP client a request timeout and surface 'smart search temporarily "
           "unavailable' instead of an empty result page.",
 }
 
 
-def fallback_repair(exp: dict, attempts: list[dict]) -> dict:
-    """Lookup table: fault -> candidate patches in order; then give up honestly."""
-    service = CATALOG[exp["fault"]].service
-    candidates = []
-    if service == "ml":
-        candidates = [
-            {"rationale": "Add a second ML instance and list both URLs so the server can fail over; a short "
-                          "availability-check interval lets it notice the frozen instance quickly.",
-             "patch": _ml_failover_patch(1000, 5000),
-             "expected_effect": "smart search keeps working (served by ML-2) while ML-1 is paused/down"},
-            {"rationale": "Previous attempt was not enough; detect the dead instance faster.",
-             "patch": _ml_failover_patch(500, 2000),
-             "expected_effect": "failover within ~2 s of the fault"},
-        ]
-    # Compare against what was *proposed* (the stored "patch" is normalised and would never match).
-    tried = {json.dumps(a.get("proposed"), sort_keys=True) for a in attempts}
-    for c in candidates:
-        if json.dumps(c["patch"], sort_keys=True) not in tried:
-            return c
-    return {"no_fix_possible": True, "recommendation": CODE_LEVEL_FIXES[service]}
+def fallback_suggestion(exp: dict) -> dict:
+    """Template suggestion per service (no AI)."""
+    if CATALOG[exp["fault"]].service == "ml":
+        return {"rationale": "Add a second ML instance and list both URLs so the server can fail over; a short "
+                             "availability-check interval lets it notice a frozen or stopped instance quickly.",
+                "patch": _ml_failover_patch(1000, 5000),
+                "expected_effect": "smart search keeps working (served by the second instance) while the first "
+                                   "one is paused or down"}
+    return {"no_fix_possible": True, "recommendation": CODE_LEVEL_FIXES[CATALOG[exp["fault"]].service]}
 
 
-def propose_repair(llm: LLMClient, exp: dict, current_values: dict, attempts: list[dict]) -> dict:
-    """Ask for a patch using only the allowed knobs; feed back previous attempts."""
+def suggest_fix(llm: LLMClient, exp: dict, current_values: dict) -> dict:
+    """Ask the Fix Advisor for ONE suggestion. ShutterStorm never applies it."""
     payload = {"finding": exp["analysis"], "fault": exp["fault"], "heatmap_row": exp["heatmap"],
                "scores": exp["scoring"], "allowed_knobs": KNOBS, "current_values": current_values,
-               "previous_attempts": attempts, "protected_journeys": list(PROTECTED_JOURNEYS),
                "evidence": {k: v for k, v in evidence_digest(exp, 20).items() if k != "log_tails"}}
-    data, source = _ask(llm, "Propose ONE configuration-level fix using ONLY the allowed knobs, or say that none is "
-                        "possible. The same fault will be re-injected to test it. Schema: {\"rationale\": str, "
-                        "\"patch\": {\"system_config\": {nested partial config}, \"compose_override\": {\"services\": "
-                        "{...}}}, \"expected_effect\": str} OR {\"no_fix_possible\": true, \"recommendation\": str "
-                        "(a concrete code-level fix)}. For the second ML service you only need to give "
-                        "{\"services\": {\"immich-machine-learning-2\": {}}}; fixed fields are filled in. Example of a "
-                        "valid answer: {\"rationale\": \"one sentence\", \"patch\": {\"system_config\": "
-                        "{\"job\": {\"thumbnailGeneration\": {\"concurrency\": 2}}}}, \"expected_effect\": "
-                        "\"one sentence\"}. rationale and expected_effect must be plain strings.",
-                        payload, check_repair)
+    data, source = _ask(llm, "Suggest ONE configuration-level fix for this finding using ONLY the allowed knobs, or "
+                        "say that none is possible. The suggestion is shown to a human; it is not applied. Schema: "
+                        "{\"rationale\": str, \"patch\": {\"system_config\": {nested partial config}, "
+                        "\"compose_override\": {\"services\": {...}}}, \"expected_effect\": str} OR "
+                        "{\"no_fix_possible\": true, \"recommendation\": str (a concrete code-level fix)}. For the "
+                        "second ML service you only need {\"services\": {\"immich-machine-learning-2\": {}}} and it "
+                        "is only useful if machineLearning.urls also lists it. Do not name libraries or products "
+                        "that are not in the evidence. rationale and expected_effect must be plain strings.",
+                        payload, check_suggestion)
     if data is None:
-        return {**fallback_repair(exp, attempts), "source": "fallback"}
+        return {**fallback_suggestion(exp), "source": "fallback"}
     return {**data, "source": source}
 
 
@@ -325,8 +312,8 @@ def write_report(llm: LLMClient, experiments: list[dict], overall: float | None,
     ranked = sorted(experiments, key=lambda e: e["scoring"]["severity"], reverse=True)
     items = [{"id": e["label"], "fault": e["fault"], "severity": e["scoring"]["severity_label"],
               "severity_value": e["scoring"]["severity"], "score": e["scoring"]["score"],
-              "heatmap_row": e["heatmap"], "analysis": e["analysis"], "repair": e.get("repair", {}).get("status"),
-              "recommendation": e.get("repair", {}).get("recommendation")} for e in ranked]
+              "heatmap_row": e["heatmap"], "analysis": e["analysis"],
+              "suggestion": e.get("suggestion", {}).get("summary")} for e in ranked]
     payload = {"overall_resilience_score": overall, "findings_in_rank_order": items,
                "prediction_scorecard": scorecard, "manual_findings": manual_findings}
     data, source = _ask(llm, "Write the findings report. Keep the given order and severities exactly. Lead with the "
@@ -357,16 +344,11 @@ def fallback_report(items: list[dict], overall: float | None) -> dict:
                     f"({', '.join(i['fault'] for i in fast) or 'none'}) fail fast. Users get no feedback in the hung case.")
     findings = []
     for i in items:
-        status = {"verified": "fixed (verified patch)", "unresolved": "unresolved",
-                  "no_fix_possible": "unresolved (code-level fix needed)",
-                  "skipped_by_operator": "repair skipped by operator",
-                  "not_approved": "fix proposed, not approved (no operator)",
-                  "operator_quit": "run stopped by operator"}.get(i["repair"] or "", "not attempted")
         findings.append({
             "id": i["id"], "title": f"{i['fault']}: {i['analysis']['user_visible_symptom'][:90]}",
             "severity": i["severity"], "evidence": i["analysis"]["summary"],
-            "fix": i["recommendation"] or CODE_LEVEL_FIXES.get(CATALOG[i["fault"]].service, ""),
-            "status": status,
+            "fix": i["suggestion"] or CODE_LEVEL_FIXES.get(CATALOG[i["fault"]].service, ""),
+            "status": "suggested fix (not applied, not tested)",
         })
     recs = ["Add request timeouts on every server->dependency call (ML HTTP, BullMQ enqueue, DB pool) so hangs become "
             "fast, explicit errors.",

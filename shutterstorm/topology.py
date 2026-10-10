@@ -14,12 +14,12 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from .config import ML, ML2, POSTGRES, REDIS, SERVER
+from .config import ML, POSTGRES, REDIS, SERVER
 from .faults import FaultSpec
 
 SERVICE_CONTAINERS = {"server": SERVER, "ml": ML, "redis": REDIS, "database": POSTGRES}
 COMPOSE_TO_SERVICE = {"immich-server": "server", "immich-machine-learning": "ml", "redis": "redis",
-                      "database": "database", "immich-machine-learning-2": "ml2"}
+                      "database": "database"}
 
 # Which backing services each user journey needs (the server is implied for all).
 JOURNEY_DEPS: dict[str, list[str]] = {
@@ -82,7 +82,6 @@ def discover(ctx) -> dict:
         "edges": _dedupe(edges),
         "journey_deps": JOURNEY_DEPS,
         "undeclared_dependencies": [f"{e['from']} -> {e['to']} ({e['label']})" for e in undeclared],
-        "ml2_running": ctx.docker.state(ML2)["running"],
     }
 
 

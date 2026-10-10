@@ -58,7 +58,7 @@ def render_markdown(data: dict) -> str:
     out.append(f"LLM mode: `{data.get('llm_mode')}`; sources: {data.get('llm_stats', {})}\n")
     out.append(f"## Executive summary  _(AI: {rep.get('source', 'n/a')})_\n\n{rep.get('executive_summary', '')}\n\n_{PATTERN}_\n")
     out.append("> AI-written text is checked only for numbers and fault names, not for every statement. "
-               "Scores, ranking, heatmap and repair pass/fail are measured.\n")
+               "Scores, ranking and heatmap are measured. Fixes are suggestions only (never applied).\n")
 
     out.append("## Ranked findings\n")
     out.append("| # | Finding | Severity | Score | Status | Fix |\n|---|---|---|---|---|---|")
@@ -91,16 +91,19 @@ def render_markdown(data: dict) -> str:
                    f"- **Integrity:** {json.dumps({k: v for k, v in e['integrity'].items() if k != 'details'})}\n"
                    f"- **Predicted:** {e['prediction']['predicted_impacted']} ({e['prediction']['source']}); "
                    f"**actual:** {e['actual_impacted']}")
-        r = e.get("repair")
-        if r:
-            note = "" if r["status"] == "verified" else " _(AI suggestion, not verified by a test)_"
-            out.append(f"- **Repair:** {r['status']} after {len(r.get('attempts', []))} attempt(s). {r.get('recommendation', '')}{note}")
-            for att in r.get("attempts", []):
-                appr = att.get("approval")
-                appr_txt = f" [approval: {appr['decision']} by {appr['by']} at {appr['at']}]" if appr else ""
-                out.append(f"  - attempt {att['n']} ({att.get('source')}){appr_txt}: {att.get('result')} "
-                           f"{'; '.join(att.get('reasons', []) or att.get('errors', []))}")
-                out.append("    ```\n" + "\n".join("    " + line for line in att.get("diff", "").splitlines()) + "\n    ```")
+        sug = e.get("suggestion")
+        if sug:
+            out.append(f"- **Suggested fix** _(source: {sug['source']}; not applied, not tested)_:")
+            if sug["kind"] == "config":
+                out.append(f"  - Why: {sug.get('rationale')}")
+                out.append(f"  - Uses allowed settings only: {'yes' if sug['valid'] else 'no: ' + '; '.join(sug['validation_errors'])}")
+                out.append("    ```\n" + "\n".join("    " + line for line in sug.get("diff", "").splitlines())
+                           + "\n    ```")
+            else:
+                out.append(f"  - No config-level fix: {sug['recommendation']}")
+            out.append(f"  - Code-level fix (template): {sug.get('template_code_fix', '')}")
+        elif e.get("repair"):
+            out.append(f"- _(older run: repair loop result {e['repair'].get('status')}; see findings.json)_")
         out.append("")
 
     sc = data.get("scorecard") or {}
@@ -171,8 +174,8 @@ def render_html(data: dict) -> str:
 <div class="card hero"><div><div class="score">{_e(data.get('overall_score'))}</div><div class="muted">overall resilience / 100</div></div>
 <div style="flex:1;min-width:260px"><b>Executive summary</b>{badge(rep.get('source'))}<p>{_e(rep.get('executive_summary'))}</p>
 <p class="pattern">{_e(PATTERN)}</p><p class="muted">AI-written text (badges live/cache) is checked only for
-numbers and fault names, not for every statement. Scores, ranking, heatmap and repair pass/fail are measured, not
-AI-generated.</p></div></div>"""]
+numbers and fault names, not for every statement. Scores, ranking and heatmap are measured, not AI-generated.
+Fixes are suggestions only: ShutterStorm never applies them.</p></div></div>"""]
 
     parts.append("<h2>Ranked findings</h2><div class='card scroll'><table><tr><th>#</th><th>Finding</th><th>Severity</th>"
                  "<th>S_e</th><th>Evidence</th><th>Fix</th><th>Status</th></tr>")
@@ -217,22 +220,21 @@ AI-generated.</p></div></div>"""]
                      f"<p><b>Prediction</b>{badge(e['prediction'].get('source'))}: {_e(e['prediction']['predicted_impacted'])} "
                      f"&rarr; actual {_e(e['actual_impacted'])}<br><span class='muted'>{_e(e['prediction'].get('reasoning'))}</span></p>"
                      f"<p><b>Integrity:</b> {_e(integ)}</p>")
-        r = e.get("repair")
-        if r:
-            note = "" if r["status"] == "verified" else " <span class='muted'>(AI suggestion, not verified by a test)</span>"
-            parts.append(f"<p><b>Repair loop: {_e(r['status'])}</b>{badge(r.get('source'))} {_e(r.get('recommendation'))}{note}</p>")
-            for att in r.get("attempts", []):
-                why = "; ".join(att.get("reasons", []) or att.get("errors", []))
-                appr = att.get("approval")
-                appr_txt = (f" <span class='muted'>(approval: {_e(appr['decision'])} by {_e(appr['by'])} at "
-                            f"{_e(appr['at'])})</span>") if appr else ""
-                parts.append(f"<p>Attempt {att['n']}{badge(att.get('source'))}{appr_txt}: <b>{_e(att.get('result'))}</b> "
-                             f"{_e(why)} {('&middot; re-test score ' + _e(att.get('retest_score')) + ' (' + _e(att.get('score_delta')) + ')') if 'retest_score' in att else ''}"
-                             f"<br><span class='muted'>{_e(att.get('rationale'))}</span></p><pre>{_e(att.get('diff'))}</pre>")
-                if att.get("retest_heatmap"):
-                    parts.append("<div class='scroll'><table><tr><th>re-test</th>" + "".join(f"<th>{j}</th>" for j in JOURNEYS)
-                                 + "</tr><tr><td>after patch</td>" + "".join(_cell(att["retest_heatmap"][j]) for j in JOURNEYS)
-                                 + "</tr></table></div>")
+        sug = e.get("suggestion")
+        if sug:
+            parts.append(f"<p><b>Suggested fix</b>{badge(sug['source'])} <span class='muted'>(not applied, not tested)</span></p>")
+            if sug["kind"] == "config":
+                ok = "yes" if sug["valid"] else "no: " + "; ".join(sug["validation_errors"])
+                parts.append(f"<p>{_e(sug.get('rationale'))}<br><span class='muted'>Uses allowed settings only: {_e(ok)}</span></p>"
+                             f"<pre>{_e(sug.get('diff'))}</pre>")
+                if sug.get("manual_steps"):
+                    parts.append("<details><summary class='muted'>How a human could apply it</summary><ol>"
+                                 + "".join(f"<li><pre>{_e(st)}</pre></li>" for st in sug["manual_steps"]) + "</ol></details>")
+            else:
+                parts.append(f"<p>No config-level fix: {_e(sug['recommendation'])}</p>")
+            parts.append(f"<p class='muted'>Code-level fix (template): {_e(sug.get('template_code_fix'))}</p>")
+        elif e.get("repair"):
+            parts.append(f"<p class='muted'>Older run: repair loop result {_e(e['repair'].get('status'))} (see findings.json).</p>")
         logs = e.get("log_tails", {})
         for name, lines in logs.items():
             parts.append(f"<details><summary class='muted'>log tail: {_e(name)}</summary><pre>{_e(chr(10).join(lines[-40:]))}</pre></details>")

@@ -19,7 +19,7 @@ SERVER = "immich_server"
 ML = "immich_machine_learning"
 REDIS = "immich_redis"
 POSTGRES = "immich_postgres"
-ML2 = "immich_machine_learning_2"  # only exists while a repair patch is applied
+ML2 = "immich_machine_learning_2"  # name used in suggested fixes (never created by ShutterStorm)
 CORE_CONTAINERS = (SERVER, ML, REDIS, POSTGRES)
 HELPER_PREFIX = "shutterstorm_"
 PROBE_PREFIX = "shutterstorm-probe-"
@@ -39,7 +39,6 @@ class Timings:
     abort_liveness_s: float = 30.0     # abort the run if J0 fails this long after an undo
     poll_s: float = 1.0
     healthy_timeout_s: float = 180.0   # wait for a container to become healthy
-    protected_rounds: int = 3
     round_interval_s: float = 2.0      # minimum time between probe rounds (limits load)
 
 
@@ -54,7 +53,6 @@ SIM_TIMINGS = Timings(
     abort_liveness_s=5.0,
     poll_s=0.1,
     healthy_timeout_s=5.0,
-    protected_rounds=2,
 )
 
 
@@ -71,7 +69,6 @@ class Settings:
     llm_mode: str = "live"  # live | replay | off
     max_fault_seconds: float = 60.0
     probe_timeout_seconds: float = 10.0
-    max_repair_attempts: int = 3
     llm_budget: int = 40
     home: Path = field(default_factory=Path.cwd)  # repo root: .shutterstorm/ and runs/ live here
     simulate: bool = False
@@ -120,7 +117,7 @@ def load_settings(home: Path | None = None, simulate: bool = False) -> Settings:
     for key in list(values) + [
         "IMMICH_URL", "IMMICH_EMAIL", "IMMICH_PASSWORD", "IMMICH_DIR", "MISTRAL_API_KEY",
         "MISTRAL_MODEL", "LLM_MODE", "MAX_FAULT_SECONDS", "PROBE_TIMEOUT_SECONDS",
-        "MAX_REPAIR_ATTEMPTS", "LLM_BUDGET",
+        "LLM_BUDGET",
     ]:
         if os.environ.get(key):
             values[key] = os.environ[key]
@@ -139,7 +136,6 @@ def load_settings(home: Path | None = None, simulate: bool = False) -> Settings:
         llm_mode=llm_mode,
         max_fault_seconds=float(values.get("MAX_FAULT_SECONDS", 60)),
         probe_timeout_seconds=float(values.get("PROBE_TIMEOUT_SECONDS", 10)),
-        max_repair_attempts=int(values.get("MAX_REPAIR_ATTEMPTS", 3)),
         llm_budget=int(values.get("LLM_BUDGET", 40)),
         home=home,
         simulate=simulate,

@@ -31,12 +31,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("inject", "inject one fault with TTL + kill switch")
     p.add_argument("fault")
     p.add_argument("--duration", type=float, default=20.0)
-    p = add("run", "full workflow: baseline, experiments, analysis, optional repair, report")
+    p = add("run", "full workflow: baseline, experiments, analysis, fix suggestions, report")
     p.add_argument("--experiments", default="", help="comma-separated fault ids")
-    p.add_argument("--repair", action="store_true", help="let the Repair agent try config-level fixes")
-    p.add_argument("--keep-fix", action="store_true", help="leave a verified patch applied")
-    p.add_argument("--yes", action="store_true",
-                   help="approve every repair patch without asking (default: ask in the terminal)")
+    p.add_argument("--no-suggestions", action="store_true",
+                   help="skip the Fix Advisor (suggestions are never applied either way)")
     add("panic", "kill switch: undo everything and restore the checkpoint")
     p = add("drill", "guard drill: inject ml_pause, kill the main process, watch the guard restore")
     p.add_argument("--fault", default="ml_pause")
@@ -44,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run", required=True, help="run folder name (or path)")
     p.add_argument("--reanalyze", action="store_true",
                    help="re-run only the AI explanations on the saved evidence (no Docker/Immich access)")
-    add("list", "show the fault catalog and the allowed repair knobs")
+    add("list", "show the fault catalog and the settings fix suggestions may use")
     add("stop", "create the STOP file (the running workflow stops at the next step)")
     return parser
 

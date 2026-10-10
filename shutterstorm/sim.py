@@ -25,7 +25,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .config import COMPOSE_PROJECT, ML, ML2, OVERRIDE_FILE, POSTGRES, REDIS, SERVER
+from .config import COMPOSE_PROJECT, ML, POSTGRES, REDIS, SERVER
 from .dockerctl import CmdResult
 
 ML_IMAGE = "ghcr.io/immich-app/immich-machine-learning:v3.3.1"
@@ -43,8 +43,7 @@ COMPOSE = {
         "database": {"container_name": POSTGRES, "image": "ghcr.io/immich-app/postgres:14"},
     },
 }
-SERVICE_CONTAINER = {"immich-server": SERVER, "immich-machine-learning": ML, "redis": REDIS, "database": POSTGRES,
-                     "immich-machine-learning-2": ML2}
+SERVICE_CONTAINER = {"immich-server": SERVER, "immich-machine-learning": ML, "redis": REDIS, "database": POSTGRES}
 
 
 def default_system_config() -> dict:
@@ -89,7 +88,6 @@ class SimWorld:
         self.immich_dir.mkdir(parents=True, exist_ok=True)
         (self.immich_dir / "docker-compose.yml").write_text("# simulated compose file\n", encoding="utf-8")
         (self.immich_dir / ".env").write_text("IMMICH_VERSION=v3.3.1\n", encoding="utf-8")
-        (self.immich_dir / OVERRIDE_FILE).unlink(missing_ok=True)
         self.docker = FakeDocker(self)
         self.server = _QuietServer(("127.0.0.1", 0), _make_handler(self))
         self.server.daemon_threads = True
@@ -221,17 +219,9 @@ class FakeDocker:
 
     def _compose(self, args: list[str]) -> CmdResult:
         w = self.w
-        files = [args[i + 1] for i, a in enumerate(args) if a == "-f"]
         if "config" in args:
             return self._ok(json.dumps(COMPOSE))
         if "up" in args:
-            services: dict = {}
-            if OVERRIDE_FILE in files and (w.immich_dir / OVERRIDE_FILE).exists():
-                services = json.loads((w.immich_dir / OVERRIDE_FILE).read_text(encoding="utf-8")).get("services", {})
-            if "immich-machine-learning-2" in services:
-                w.change(lambda: w.containers.setdefault(ML2, SimWorld._container(ML2)))
-            elif "--remove-orphans" in args:
-                w.change(lambda: w.containers.pop(ML2, None))
             if "--force-recreate" in args:
                 target = SERVICE_CONTAINER[args[-1]]
                 w.change(lambda: w.containers[target].update(nano=0, running=True, paused=False))
@@ -374,12 +364,7 @@ def _make_handler(w: SimWorld):
             self._send(404, {"message": "unknown route"})
 
         def _smart_search(self) -> None:
-            cfg = w.system_config["machineLearning"]
-            names = [ML2 if "machine-learning-2" in u else ML for u in cfg["urls"]]
-            names = [n for n in names if n in w.containers] or [ML]
-            chosen = names[0]
-            if cfg["availabilityChecks"]["enabled"] and len(names) > 1:
-                chosen = next((n for n in names if w.up(n)), names[0])
+            chosen = ML
             if not self._gate(chosen, "Failed to search smart (Immich Server Error)"):
                 return
             if chosen == ML and w.netem:
@@ -388,15 +373,6 @@ def _make_handler(w: SimWorld):
                 time.sleep(0.8)
             items = [self._asset_dto(a) for a in list(w.assets.values())[:3]]
             self._send(200, {"assets": {"items": items, "total": len(items)}})
-
-        def do_PUT(self) -> None:
-            raw = self._body()
-            if not self._server_up() or not self._authed() or not self._gate(POSTGRES, "Database unavailable"):
-                return
-            if self.path == "/api/system-config":
-                w.change(lambda: setattr(w, "system_config", copy.deepcopy(json.loads(raw))))
-                return self._send(200, w.system_config)
-            self._send(404, {"message": "unknown route"})
 
         def do_DELETE(self) -> None:
             raw = self._body()

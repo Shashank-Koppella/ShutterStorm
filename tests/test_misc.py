@@ -2,7 +2,7 @@
 import json
 import zlib
 
-from shutterstorm.agents import check_analysis, fallback_repair
+from shutterstorm.agents import check_analysis, fallback_suggestion
 from shutterstorm.config import Settings, parse_env_file, redact
 from shutterstorm.llm import LLMClient
 from shutterstorm.probes import make_png, percentile
@@ -64,12 +64,10 @@ def test_schema_checks():
                            "user_visible_symptom": "", "severity_rationale": ""}) == []
 
 
-def test_fallback_repair_gives_up_for_redis():
-    exp = {"fault": "redis_pause"}
-    assert fallback_repair(exp, [])["no_fix_possible"] is True
-    first = fallback_repair({"fault": "ml_pause"}, [])
-    second = fallback_repair({"fault": "ml_pause"}, [{"proposed": first["patch"]}])
-    assert first["patch"] != second["patch"]
+def test_fallback_suggestions():
+    assert fallback_suggestion({"fault": "redis_pause"})["no_fix_possible"] is True
+    ml = fallback_suggestion({"fault": "ml_pause"})
+    assert "machineLearning" in ml["patch"]["system_config"]
 
 
 def test_discover_finds_undeclared_ml_dependency(ctx):

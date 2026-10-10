@@ -1,6 +1,6 @@
 """Fault catalog and the generic undo machinery.
 
-Every change ShutterStorm makes (fault *or* repair patch) is described by a
+Every fault ShutterStorm applies is described by a
 JSON *recipe* that says how to undo it, including the original values. Recipes
 are self-contained, so the guard process and ``panic`` can undo them without
 knowing which fault created them.
@@ -16,13 +16,12 @@ Flow for a fault::
 """
 from __future__ import annotations
 
-import json
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import CORE_CONTAINERS, ML, ML2, OVERRIDE_FILE, POSTGRES, REDIS, SERVER
+from .config import ML, POSTGRES, REDIS, SERVER
 from .dockerctl import DockerError
 
 NETEM_IMAGE = "nicolaka/netshoot"
@@ -132,10 +131,6 @@ def undo_recipe(ctx, recipe: dict) -> None:
         _restore_cpus(ctx, c, int(recipe["nano_cpus"]))
     elif kind == "netem":
         _remove_netem(ctx, recipe)
-    elif kind == "system_config":
-        ctx.admin(fresh=True).put_system_config(recipe["config"])
-    elif kind == "compose_override":
-        restore_override(ctx, recipe.get("original"))
     else:
         raise FaultError(f"unknown recipe type {kind}")
 
@@ -160,18 +155,6 @@ def verify_recipe(ctx, recipe: dict) -> tuple[bool, str]:
             return False, f"helpers still present: {d.list_helpers()}"
         has = netem_present(ctx)
         return has is not True, "no netem qdisc" if has is False else ("netem check skipped" if has is None else "netem still active")
-    if kind == "system_config":
-        current = ctx.admin(fresh=True).get_system_config()
-        same = json.dumps(current, sort_keys=True) == json.dumps(recipe["config"], sort_keys=True)
-        return same, "system-config matches original" if same else "system-config differs from original"
-    if kind == "compose_override":
-        path = Path(ctx.settings.immich_dir) / OVERRIDE_FILE
-        original = recipe.get("original")
-        content = path.read_text(encoding="utf-8") if path.exists() else None
-        ml2 = d.state(ML2)["exists"]
-        expect_ml2 = original is not None and ML2 in (original or "")
-        ok = content == original and ml2 == expect_ml2
-        return ok, f"override {'restored' if content == original else 'differs'}, {ML2} exists={ml2}"
     return False, f"unknown recipe type {kind}"
 
 
@@ -230,23 +213,6 @@ def netem_present(ctx) -> bool | None:
         return "netem" in out
     finally:
         d.remove_helper(probe)
-
-
-def compose_files(ctx, with_override: bool) -> list[str]:
-    return ["docker-compose.yml"] + ([OVERRIDE_FILE] if with_override else [])
-
-
-def restore_override(ctx, original: str | None) -> None:
-    """Put the override file back as it was and bring compose in line with it."""
-    path = Path(ctx.settings.immich_dir) / OVERRIDE_FILE
-    if original is None:
-        path.unlink(missing_ok=True)
-    else:
-        path.write_text(original, encoding="utf-8")
-    ctx.docker.compose(Path(ctx.settings.immich_dir), compose_files(ctx, original is not None),
-                       ["up", "-d", "--remove-orphans"])
-    for name in CORE_CONTAINERS:
-        ctx.docker.wait_healthy(name, ctx.settings.timings.healthy_timeout_s, ctx.settings.timings.poll_s)
 
 
 # ============================================================== active fault

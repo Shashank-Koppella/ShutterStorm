@@ -1,7 +1,7 @@
 """One chaos experiment: inject -> observe -> undo -> recovery -> integrity.
 
 This is pure deterministic code (no LLM). It is used by ``inject`` (Day-1
-demo) and by the full workflow, including the re-test inside the repair loop.
+demo) and by the full workflow.
 """
 from __future__ import annotations
 
