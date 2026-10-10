@@ -64,9 +64,20 @@ def cmd_doctor(settings: Settings, args: Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 - doctor reports every failure
             checks.append(("Immich login", False, str(exc)))
         mode = ctx.settings.llm_mode
-        has_key = bool(ctx.settings.mistral_api_key)
-        checks.append(("Mistral key", has_key or mode != "live",
-                       f"LLM_MODE={mode}, key {'set' if has_key else 'missing'}"))
+        if ctx.settings.agents_url:
+            try:
+                import requests
+
+                health = requests.get(ctx.settings.agents_url.rstrip("/") + "/health", timeout=5).json()
+                checks.append(("agents container", health.get("ok") and (health.get("key") or health.get("llm_mode") != "live"),
+                               f"{ctx.settings.agents_url}: model {health.get('model')}, LLM_MODE={health.get('llm_mode')}, "
+                               f"key {'set' if health.get('key') else 'missing'}"))
+            except Exception as exc:  # noqa: BLE001
+                checks.append(("agents container", False, f"{ctx.settings.agents_url}: {exc.__class__.__name__}"))
+        else:
+            has_key = bool(ctx.settings.mistral_api_key)
+            checks.append(("Mistral key", has_key or mode != "live",
+                           f"LLM_MODE={mode}, key {'set' if has_key else 'missing'}"))
         free_gb = shutil.disk_usage(ctx.settings.home).free / 1e9
         checks.append(("disk space", free_gb > 2, f"{free_gb:.1f} GB free"))
         pending = ctx.journal.entries()
@@ -446,5 +457,5 @@ def wait_for_queues(ctx: Ctx, client, upload_start: float, limit_s: float = 1800
 def cmd_dashboard(settings: Settings, args: Namespace) -> int:
     from .dashboard import serve
 
-    serve(settings, args.port)
+    serve(settings, args.port, args.host)
     return 0

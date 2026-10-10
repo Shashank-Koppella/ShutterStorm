@@ -48,7 +48,7 @@ def _need(data: dict, fields: dict[str, type]) -> list[str]:
 
 def check_prediction(d: dict) -> list[str]:
     errors = _need(d, {"predicted_impact": list, "reasoning": str})
-    if not errors and any(j not in JOURNEYS for j in d["predicted_impact"]):
+    if not errors and any(not isinstance(j, str) or j not in JOURNEYS for j in d["predicted_impact"]):
         errors.append(f"predicted_impact may only contain {list(JOURNEYS)}")
     return errors
 

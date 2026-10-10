@@ -12,10 +12,61 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+
+
+HEARTBEAT_EVERY_S = 2.0
+_heartbeats: dict[str, threading.Thread] = {}
+
+
+def owner_id() -> str:
+    """This process, as other containers can name it: ``<hostname>-<pid>``."""
+    return f"{socket.gethostname()}-{os.getpid()}"
+
+
+def heartbeat_path(state_dir: Path, owner: str) -> Path:
+    return state_dir / "heartbeats" / f"{owner}.json"
+
+
+def start_heartbeat(state_dir: Path) -> None:
+    """Write ``heartbeats/<owner>.json`` every 2 s for as long as this process lives.
+
+    A process id means nothing in another container, so a guard running in its own container
+    decides whether the owner of a journal entry is alive from this file's age instead.
+    """
+    owner = owner_id()
+    if owner in _heartbeats and _heartbeats[owner].is_alive():
+        return
+    path = heartbeat_path(state_dir, owner)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def beat() -> None:
+        while True:
+            try:
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"t": time.time(), "owner": owner}), encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError:
+                pass
+            time.sleep(HEARTBEAT_EVERY_S)
+
+    thread = threading.Thread(target=beat, daemon=True, name="shutterstorm-heartbeat")
+    _heartbeats[owner] = thread
+    thread.start()
+
+
+def heartbeat_age(state_dir: Path, owner: str) -> float | None:
+    """Seconds since ``owner`` last beat, or ``None`` if it never did."""
+    try:
+        data = json.loads(heartbeat_path(state_dir, owner).read_text(encoding="utf-8"))
+        return time.time() - float(data["t"])
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 class Journal:
@@ -79,7 +130,10 @@ class Journal:
             "created_at": time.time(),
             "deadline": time.time() + ttl_s if ttl_s else None,
             "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "owner": owner_id(),
         }
+        start_heartbeat(self.state_dir)
         with self._locked():
             entries = self._read()
             entries.append(entry)

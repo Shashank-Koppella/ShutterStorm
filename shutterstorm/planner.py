@@ -216,10 +216,20 @@ def check_plan(data: dict, cands: list[dict], budget: int) -> list[str]:
     return errors
 
 
-def plan(ctx, llm: LLMClient, topology: dict, budget: int = DEFAULT_BUDGET) -> dict:
-    """Return the experiment plan: ordered faults with reasons, plus every candidate's features."""
+def plan(ctx, agents, topology: dict, budget: int = DEFAULT_BUDGET) -> dict:
+    """Controller side: gather the candidates (Docker, run history), then ask the Planner agent.
+
+    ``agents`` is an :class:`~shutterstorm.agentclient.Agents` (local or remote) or a plain
+    :class:`LLMClient` (run in-process)."""
+    from .agentclient import Agents
+
+    agents = agents if isinstance(agents, Agents) else Agents.local(agents)
     history = run_history(ctx.settings.runs_dir, ctx.simulate)
-    cands = candidates(ctx, topology, history)
+    return agents.plan(topology, candidates(ctx, topology, history), budget)
+
+
+def plan_from(llm: LLMClient, topology: dict, cands: list[dict], budget: int = DEFAULT_BUDGET) -> dict:
+    """Agent side (pure, JSON in / JSON out): the experiment plan with reasons, plus the candidates."""
     fallback = deterministic_plan(cands, budget)
     payload = {
         "dependency_edges": [{k: e[k] for k in ("from", "to", "source", "label")} for e in topology["edges"]],
@@ -367,9 +377,18 @@ def check_decision(d: dict, allowed: set[str]) -> list[str]:
     return errors
 
 
-def decide_next(ctx, llm: LLMClient, the_plan: dict, done_exps: list[dict], caps: Thresholds,
-                budget: int) -> dict | None:
-    """Decide the next experiment (what), now (when), and with which strength / limits (how safely)."""
+def decide_next(ctx, agents, the_plan: dict, done_exps: list[dict], caps: Thresholds, budget: int) -> dict | None:
+    """Controller side: ask the Planner agent (local or remote) for the next decision."""
+    from .agentclient import Agents
+
+    agents = agents if isinstance(agents, Agents) else Agents.local(agents)
+    return agents.decide_next(the_plan, done_exps, caps, budget, ctx.settings.max_fault_seconds,
+                              ctx.settings.timings.fault_window_s)
+
+
+def decide_next_from(llm: LLMClient, the_plan: dict, done_exps: list[dict], caps: Thresholds, budget: int,
+                     max_fault_s: float, default_window: float) -> dict | None:
+    """Agent side: decide the next experiment (what), now (when), and its strength / limits (how safely)."""
     cands = the_plan["candidates"]
     done = [observation(e) for e in done_exps]
     picked = [c for f in done for c in cands if c["fault"] == f["fault"]]
@@ -380,8 +399,7 @@ def decide_next(ctx, llm: LLMClient, the_plan: dict, done_exps: list[dict], caps
     remaining_plan = [i for i in the_plan["items"] if i["fault"] not in {f["fault"] for f in done}]
     fallback = deterministic_next(cands, remaining_plan, done, budget)
     bounds = {c["fault"]: {k: {"default": v[0], "min": v[1], "max": v[2]}
-                           for k, v in setting_bounds(CATALOG[c["fault"]], caps, ctx.settings.max_fault_seconds,
-                                                      ctx.settings.timings.fault_window_s).items()}
+                           for k, v in setting_bounds(CATALOG[c["fault"]], caps, max_fault_s, default_window).items()}
               for c in pool}
     payload = {
         "step": len(done) + 1, "budget": budget,
@@ -416,14 +434,12 @@ def decide_next(ctx, llm: LLMClient, the_plan: dict, done_exps: list[dict], caps
         spec = CATALOG[fallback["fault"]]
         decision = {"fault": fallback["fault"], "reason": fallback["reason"], "source": "fallback",
                     "safety_reason": "default strength and the configured safety limits (no valid AI decision)",
-                    **decide_settings(spec, None, caps, ctx.settings.max_fault_seconds, "default",
-                                      ctx.settings.timings.fault_window_s)}
+                    **decide_settings(spec, None, caps, max_fault_s, "default", default_window)}
     else:
         spec = CATALOG[data["fault"]]
         decision = {"fault": data["fault"], "reason": data["reason"].strip(), "source": source,
                     "safety_reason": data["safety_reason"].strip(),
-                    **decide_settings(spec, data.get("settings"), caps, ctx.settings.max_fault_seconds, source,
-                                      ctx.settings.timings.fault_window_s)}
+                    **decide_settings(spec, data.get("settings"), caps, max_fault_s, source, default_window)}
     decision.update(step=len(done) + 1, followed_plan=decision["fault"] == plan_next, plan_next=plan_next)
     return decision
 

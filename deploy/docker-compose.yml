@@ -1,0 +1,106 @@
+# ShutterStorm in containers (compose project "shutterstorm", separate from Immich's "immich").
+#
+#   docker compose --env-file shutterstorm.env -f deploy/docker-compose.yml up -d --build
+#   docker compose --env-file shutterstorm.env -f deploy/docker-compose.yml exec controller python3 -m shutterstorm doctor
+#   docker compose --env-file shutterstorm.env -f deploy/docker-compose.yml exec controller python3 -m shutterstorm run
+#   dashboard: http://127.0.0.1:8766
+#
+# Isolation by design:
+#   agents      AI only. Mistral key. NO Docker socket, no Immich credentials, read-only filesystem,
+#               all capabilities dropped. Only on the internal "ai" network (no gateway): no route to
+#               Immich, the host or the internet. Its single way out is the egress proxy.
+#   egress      allow-list proxy: CONNECT tunnels to api.mistral.ai:443 and nothing else.
+#   controller  acts on Immich (Docker socket, immich_default network, Immich login) and re-checks
+#               every answer from the agents before acting on it.
+#   guard       always running; undoes faults whose owner stopped sending heartbeats or whose TTL passed.
+# The scope check refuses every container except the four Immich ones and our labelled
+# shutterstorm_* helpers, so these three containers can never be fault targets.
+name: shutterstorm
+
+x-controller-env: &controller-env
+  IMMICH_URL: http://immich_server:2283
+  IMMICH_EMAIL: ${IMMICH_EMAIL:?set IMMICH_EMAIL in shutterstorm.env}
+  IMMICH_PASSWORD: ${IMMICH_PASSWORD:?set IMMICH_PASSWORD in shutterstorm.env}
+  IMMICH_DIR: /immich
+  TZ: ${TZ:-UTC}   # set TZ in shutterstorm.env so run folders sort with the ones made on the host
+  LLM_MODE: ${LLM_MODE:-live}
+  MAX_FAULT_SECONDS: ${MAX_FAULT_SECONDS:-60}
+  PROBE_TIMEOUT_SECONDS: ${PROBE_TIMEOUT_SECONDS:-10}
+  ABORT_ERROR_RATE: ${ABORT_ERROR_RATE:-0.75}
+  ABORT_P95_MS: ${ABORT_P95_MS:-8000}
+
+x-controller-volumes: &controller-volumes
+  - /var/run/docker.sock:/var/run/docker.sock
+  - ${IMMICH_DIR:?set IMMICH_DIR in shutterstorm.env}:/immich:ro
+  - state:/app/.shutterstorm
+  - ../runs:/app/runs
+
+services:
+  agents:
+    build: {context: .., dockerfile: deploy/Dockerfile, target: agents}
+    image: shutterstorm-agents:local
+    container_name: shutterstorm-agents
+    environment:
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      MISTRAL_MODEL: ${MISTRAL_MODEL:-ministral-8b-latest}
+      LLM_MODE: ${LLM_MODE:-live}
+      LLM_BUDGET: ${LLM_BUDGET:-40}
+      HTTPS_PROXY: http://egress:3128
+      HTTP_PROXY: http://egress:3128
+      NO_PROXY: localhost,127.0.0.1
+    volumes:
+      - llm-cache:/app/.shutterstorm/llm_cache
+    networks: [ai]
+    depends_on: [egress]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  egress:
+    image: shutterstorm-agents:local
+    container_name: shutterstorm-egress
+    command: ["python", "-m", "shutterstorm.egress_proxy", "--allow", "api.mistral.ai:443"]
+    networks: [ai, egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  guard:
+    build: {context: .., dockerfile: deploy/Dockerfile, target: controller}
+    image: shutterstorm-controller:local
+    container_name: shutterstorm-guard
+    entrypoint: ["python3", "-m", "shutterstorm.guard"]
+    command: ["--home", "/app", "--forever"]
+    environment: *controller-env
+    volumes: *controller-volumes
+    networks: [immich]
+    restart: unless-stopped
+
+  controller:
+    image: shutterstorm-controller:local
+    container_name: shutterstorm-controller
+    command: ["dashboard", "--host", "0.0.0.0", "--port", "8765"]
+    environment:
+      <<: *controller-env
+      AGENTS_URL: http://agents:8780
+      SHUTTERSTORM_GUARD: external
+    volumes: *controller-volumes
+    ports: ["127.0.0.1:8766:8765"]
+    networks: [ai, immich]
+    depends_on: [agents, guard]
+    restart: unless-stopped
+
+networks:
+  ai:
+    internal: true   # no gateway: members reach each other only
+  egress: {}
+  immich:
+    external: true
+    name: immich_default
+
+volumes:
+  llm-cache: {}
+  state: {}

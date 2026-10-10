@@ -63,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     add("list", "show the fault catalog and the settings fix suggestions may use")
     p = add("dashboard", "local web UI: inject a fault, watch it live, see the suggested fix")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--host", default="127.0.0.1", help="bind address (0.0.0.0 only inside the controller container)")
     add("stop", "create the STOP file (the running workflow stops at the next step)")
     return parser
 

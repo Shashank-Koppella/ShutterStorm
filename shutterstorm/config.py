@@ -89,6 +89,7 @@ class Settings:
     max_fault_seconds: float = 60.0
     probe_timeout_seconds: float = 10.0
     llm_budget: int = 40
+    agents_url: str = ""  # set -> the AI agents run in the isolated agents container (HTTP)
     home: Path = field(default_factory=Path.cwd)  # repo root: .shutterstorm/ and runs/ live here
     simulate: bool = False
     timings: Timings = field(default_factory=Timings)
@@ -137,7 +138,7 @@ def load_settings(home: Path | None = None, simulate: bool = False) -> Settings:
     for key in list(values) + [
         "IMMICH_URL", "IMMICH_EMAIL", "IMMICH_PASSWORD", "IMMICH_DIR", "MISTRAL_API_KEY",
         "MISTRAL_MODEL", "LLM_MODE", "MAX_FAULT_SECONDS", "PROBE_TIMEOUT_SECONDS",
-        "LLM_BUDGET", "ABORT_ERROR_RATE", "ABORT_P95_MS", "ABORT_ROUNDS", "ABORT_BLAST_RADIUS",
+        "LLM_BUDGET", "AGENTS_URL", "ABORT_ERROR_RATE", "ABORT_P95_MS", "ABORT_ROUNDS", "ABORT_BLAST_RADIUS",
     ]:
         if os.environ.get(key):
             values[key] = os.environ[key]
@@ -157,6 +158,7 @@ def load_settings(home: Path | None = None, simulate: bool = False) -> Settings:
         max_fault_seconds=float(values.get("MAX_FAULT_SECONDS", 60)),
         probe_timeout_seconds=float(values.get("PROBE_TIMEOUT_SECONDS", 10)),
         llm_budget=int(values.get("LLM_BUDGET", 40)),
+        agents_url=values.get("AGENTS_URL", ""),
         home=home,
         simulate=simulate,
         thresholds=Thresholds(

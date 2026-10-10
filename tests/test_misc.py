@@ -59,6 +59,10 @@ def test_llm_off_and_replay_and_live_validation(tmp_path):
 
 
 def test_schema_checks():
+    from shutterstorm.agents import check_prediction
+
+    assert check_prediction({"predicted_impact": [{"journey": "J3"}], "reasoning": "x"})  # rejected, not a crash
+    assert check_prediction({"predicted_impact": ["J3"], "reasoning": "x"}) == []
     assert check_analysis({}) != []
     assert check_analysis({"summary": "", "affected_journeys": [], "root_cause_hypothesis": "",
                            "user_visible_symptom": "", "severity_rationale": ""}) == []

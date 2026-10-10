@@ -227,7 +227,7 @@ def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def serve(settings: Settings, port: int = 8765) -> None:
+def serve(settings: Settings, port: int = 8765, host: str = "127.0.0.1") -> None:
     ctx = build_context(settings)
     home = settings.home
     job = Job(home)
@@ -298,8 +298,8 @@ def serve(settings: Settings, port: int = 8765) -> None:
                 return self._json({"panic": True})
             self._json({"error": "unknown"}, 404)
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"ShutterStorm dashboard: http://127.0.0.1:{port}   (Ctrl+C to quit)", flush=True)
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"ShutterStorm dashboard: http://{host}:{port}   (Ctrl+C to quit)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

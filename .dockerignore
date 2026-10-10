@@ -1,0 +1,12 @@
+# Never bake secrets, results or local state into an image.
+shutterstorm.env
+.shutterstorm/
+runs/
+datasets/
+*.zip
+.git/
+.github/
+.pytest_cache/
+**/__pycache__/
+*.pyc
+tests/

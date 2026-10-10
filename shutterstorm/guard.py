@@ -8,11 +8,17 @@ undoes an entry when either
 
 It exits once the journal is empty. Because it is a separate OS process, it
 restores the system even if the main ShutterStorm process is killed.
+
+In the container setup the guard is its own long-running container (``--forever``) and the
+controller does not spawn one (``SHUTTERSTORM_GUARD=external``). Process ids do not cross
+containers, so for an entry written on another host the guard checks the owner's heartbeat
+file instead (``journal.start_heartbeat``): no beat for ``HEARTBEAT_STALE_S`` = owner is gone.
 """
 from __future__ import annotations
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -21,6 +27,7 @@ from pathlib import Path
 
 GRACE_S = 10.0
 MAX_LIFETIME_S = 3600.0
+HEARTBEAT_STALE_S = 15.0
 
 
 def pid_alive(pid: int) -> bool:
@@ -49,9 +56,17 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
-def entry_is_orphaned(entry: dict, now: float, alive=pid_alive) -> str | None:
+def entry_is_orphaned(entry: dict, now: float, alive=pid_alive, state_dir: Path | None = None) -> str | None:
     """Return why the guard should undo ``entry`` now, or ``None`` to keep waiting."""
-    if not alive(int(entry.get("pid", 0))):
+    from .journal import heartbeat_age
+
+    host = entry.get("host")
+    if host and host != socket.gethostname() and state_dir is not None:
+        age = heartbeat_age(state_dir, entry.get("owner", ""))
+        if age is None or age > HEARTBEAT_STALE_S:
+            return (f"owner {entry.get('owner')} on {host} stopped sending heartbeats"
+                    + (f" {age:.0f}s ago" if age is not None else ""))
+    elif not alive(int(entry.get("pid", 0))):
         return f"owner process {entry.get('pid')} is gone"
     deadline = entry.get("deadline")
     if deadline and now > deadline + GRACE_S:
@@ -59,19 +74,22 @@ def entry_is_orphaned(entry: dict, now: float, alive=pid_alive) -> str | None:
     return None
 
 
-def guard_loop(ctx, poll_s: float = 1.0, alive=pid_alive, max_lifetime_s: float = MAX_LIFETIME_S) -> int:
-    """Watch the journal until it is empty. Returns the number of entries the guard undid."""
+def guard_loop(ctx, poll_s: float = 1.0, alive=pid_alive, max_lifetime_s: float = MAX_LIFETIME_S,
+               forever: bool = False) -> int:
+    """Watch the journal until it is empty (or forever). Returns the number of entries undone."""
     from .faults import undo_entry
 
     started = time.time()
     undone = 0
-    while time.time() - started < max_lifetime_s:
+    while forever or time.time() - started < max_lifetime_s:
+        if forever:
+            _beat_guard(ctx)
         entries = ctx.journal.entries()
-        if not entries:
+        if not entries and not forever:
             ctx.log("[guard] journal empty, exiting")
             return undone
         for entry in entries:
-            reason = entry_is_orphaned(entry, time.time(), alive)
+            reason = entry_is_orphaned(entry, time.time(), alive, ctx.journal.state_dir)
             if reason:
                 ctx.log(f"[guard] taking over {entry['label']}: {reason}")
                 ok, _ = undo_entry(ctx, entry, who="guard")
@@ -85,12 +103,31 @@ def _guard_pid_file(ctx) -> Path:
     return ctx.journal.state_dir / "guard.pid"
 
 
+def _beat_guard(ctx) -> None:
+    """The long-running (container) guard's own heartbeat, so the controller can see it is alive."""
+    try:
+        (ctx.journal.state_dir / "guard.heartbeat").write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def external_guard_alive(ctx, max_age_s: float = 10.0) -> bool:
+    try:
+        return time.time() - float((ctx.journal.state_dir / "guard.heartbeat").read_text()) < max_age_s
+    except (OSError, ValueError):
+        return False
+
+
 def spawn_guard(ctx) -> None:
     """Start the guard unless one is already running.
 
     Real mode: a detached OS process that survives the parent. Simulation mode:
     a daemon thread (the fake Docker lives inside this process).
     """
+    if os.environ.get("SHUTTERSTORM_GUARD") == "external":
+        if external_guard_alive(ctx):
+            return  # the guard container watches the journal
+        ctx.log("external guard container not seen in the last 10 s; starting a local guard as a fallback")
     if ctx.simulate:
         if getattr(ctx, "_sim_guard", None) and ctx._sim_guard.is_alive():
             return
@@ -120,6 +157,7 @@ def spawn_guard(ctx) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="shutterstorm.guard")
     parser.add_argument("--home", type=Path, required=True)
+    parser.add_argument("--forever", action="store_true", help="keep watching (guard container)")
     args = parser.parse_args(argv)
     from .config import load_settings
     from .context import build_context
@@ -128,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     _guard_pid_file(ctx).write_text(str(os.getpid()), encoding="utf-8")
     ctx.log(f"[guard] started, pid {os.getpid()}")
     try:
-        guard_loop(ctx)
+        guard_loop(ctx, poll_s=1.0, forever=args.forever)
     finally:
         _guard_pid_file(ctx).unlink(missing_ok=True)
     return 0

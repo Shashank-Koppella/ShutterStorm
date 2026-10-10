@@ -16,8 +16,9 @@
 
 ShutterStorm only injects faults and undoes them. It never applies a fix: suggestions are
 shown in the CLI and in the report for a human to decide on. Control flow, injection, undo,
-scoring and cleanup are deterministic code; LLMs are used only in planner.plan and
-agents.predict / analyze / suggest_fix / write_report.
+scoring and cleanup are deterministic code; LLMs are used only through ``self.agents``
+(Planner, Analyst, Fix Advisor, Reporter), in-process or in the isolated agents container
+(``AGENTS_URL``); the controller re-checks every answer before acting on it.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ from .context import Ctx, write_json
 from .experiment import run_experiment
 from .faults import FaultSpec, get_fault, undo_entry
 from .fixes import describe_patch, manual_steps, ml_image, normalize_patch, validate_patch
-from .llm import LLMClient
+from .agentclient import Agents
 from .probes import ALL_JOURNEYS, AssetTracker, Prober, ProbeResult, summarize
 from .report import MANUAL_FINDINGS, render_reports
 from .reporting_io import append_probes_csv, summary_table
@@ -60,7 +61,7 @@ class Workflow:
         self.compare_to = compare_to
         self.plan: dict = {}
         self.suggest = suggest
-        self.llm = LLMClient(ctx.settings, ctx.log)
+        self.agents = Agents(ctx.settings, ctx.log)
         self.run_dir: Path | None = None
         self.prober: Prober | None = None
         self.checkpoint: dict | None = None
@@ -85,6 +86,7 @@ class Workflow:
     def run(self) -> Path:
         ctx = self.ctx
         self.run_dir = ctx.new_run_dir("run")
+        self.agents.run_id = self.run_dir.name
         self.started = time.time()
         ctx.journal.clear_stop()
         try:
@@ -150,7 +152,7 @@ class Workflow:
     def make_plan(self) -> None:
         ctx = self.ctx
         if self.use_planner:
-            self.plan = planner.plan(ctx, self.llm, self.topology, self.budget)
+            self.plan = planner.plan(ctx, self.agents, self.topology, self.budget)
             self.specs = planner.spec_list(self.plan)
         else:
             self.plan = {"source": "operator", "strategy": "experiments given with --experiments", "items": [
@@ -171,7 +173,7 @@ class Workflow:
             if step >= self.budget:
                 return None
             self.step(f"AI decides experiment {step + 1} of up to {self.budget}")
-            decision = planner.decide_next(ctx, self.llm, self.plan, self.experiments, self.thresholds, self.budget)
+            decision = planner.decide_next(ctx, self.agents, self.plan, self.experiments, self.thresholds, self.budget)
         elif step < len(self.specs):
             decision = planner.operator_decision(self.specs[step], self.thresholds, ctx.settings.max_fault_seconds,
                                                  step + 1, ctx.settings.timings.fault_window_s)
@@ -193,7 +195,7 @@ class Workflow:
     def run_one(self, spec: FaultSpec, decision: dict) -> dict:
         self.step(f"Inject approved fault: {spec.id}")
         deterministic = predict_impact(spec, self.topology)
-        prediction = agents.predict(self.llm, spec, self.topology, deterministic)
+        prediction = self.agents.predict(spec, self.topology, deterministic)
         self.ctx.log(f"   predicted impact ({prediction['source']}): {prediction['predicted_impacted']}")
         ev = run_experiment(self.ctx, self.prober, spec, self.run_dir, on_round=self._on_round,
                             thresholds=decision["thresholds"], window_s=decision["duration_s"],
@@ -203,7 +205,7 @@ class Workflow:
         self.step(f"Confirm failure and capture evidence: {spec.id}")
         self.ctx.log(f"   heatmap: {exp['heatmap']}  score {exp['scoring']['score']}  "
                      f"severity {exp['scoring']['severity']} ({exp['scoring']['severity_label']})")
-        exp["analysis"] = agents.analyze(self.llm, exp, self.topology)
+        exp["analysis"] = self.agents.analyze(exp, self.topology)
         self.ctx.log(f"   analysis ({exp['analysis']['source']}): {exp['analysis']['summary'][:200]}")
         return exp
 
@@ -232,7 +234,7 @@ class Workflow:
         config = ctx.admin().get_system_config()
         current = {"machineLearning": {k: config["machineLearning"][k] for k in ("urls", "availabilityChecks")},
                    "job": {q: config["job"][q] for q in config["job"]}}
-        proposal = agents.suggest_fix(self.llm, exp, current)
+        proposal = self.agents.suggest_fix(exp, current)
         code_fix = agents.CODE_LEVEL_FIXES.get(spec.service, "")
         if proposal.get("no_fix_possible"):
             suggestion = {"kind": "code", "source": proposal["source"], "recommendation": proposal["recommendation"],
@@ -326,10 +328,10 @@ class Workflow:
                 (self.run_dir / "topology.md").write_text(
                     "# Dependency map\n\n```mermaid\n" + self.topology["mermaid"] + "\n```\n", encoding="utf-8")
             data["scorecard"] = prediction_scorecard(self.experiments) if self.experiments else {}
-            data["report"] = agents.write_report(self.llm, self.experiments, data["overall_score"],
+            data["report"] = self.agents.write_report(self.experiments, data["overall_score"],
                                                  data["scorecard"], MANUAL_FINDINGS) if self.experiments else {}
             data["cleanup"] = self.cleanup
-            data["llm_stats"] = {**self.llm.stats, "api_calls": self.llm.calls}
+            data["llm_stats"] = {**self.agents.stats, "agents": self.agents.where}
             if self.compare_to and self.experiments:
                 try:
                     data["comparison"] = compare_runs(self.ctx.settings, self.compare_to, data)

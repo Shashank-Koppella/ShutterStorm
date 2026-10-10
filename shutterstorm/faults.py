@@ -16,6 +16,7 @@ Flow for a fault::
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -92,13 +93,13 @@ CATALOG: dict[str, FaultSpec] = {f.id: f for f in [
     FaultSpec("redis_stop", REDIS, "stop", "Stop Redis/Valkey (job queue down)", 0.5),
     FaultSpec("db_pause", POSTGRES, "pause", "Freeze Postgres (database hung)", 0.5),
     FaultSpec("db_stop", POSTGRES, "stop", "Stop Postgres gracefully (database down)", 0.5, optional=True),
-    FaultSpec("db_cpu_throttle", POSTGRES, "cpu", "Limit Postgres to 0.25 CPU (overloaded database)", 0.6),
+    FaultSpec("db_cpu_throttle", POSTGRES, "cpu", "Limit Postgres CPU (overloaded database; default 0.25 CPU)", 0.6),
     FaultSpec("server_restart", SERVER, "restart", "Restart the API server (container crash)", 0.8),
-    FaultSpec("ml_cpu_throttle", ML, "cpu", "Limit ML to 0.25 CPU (overloaded dependency)", 0.6),
+    FaultSpec("ml_cpu_throttle", ML, "cpu", "Limit ML CPU (overloaded dependency; default 0.25 CPU)", 0.6),
     FaultSpec("traffic_spike", SERVER, "load",
-              f"Sudden traffic spike: {LOAD_WORKERS} concurrent clients browsing and searching", 0.7),
-    FaultSpec("ml_latency", ML, "latency", "Add 3000 ms network delay to ML (netem)", 0.6, optional=True),
-    FaultSpec("ml_packet_loss", ML, "loss", "Drop 30% of ML network packets (lossy network, netem)", 0.6,
+              f"Sudden traffic spike: concurrent read-only clients (default {LOAD_WORKERS})", 0.7),
+    FaultSpec("ml_latency", ML, "latency", "Add network delay to ML (netem; default 3000 ms)", 0.6, optional=True),
+    FaultSpec("ml_packet_loss", ML, "loss", "Drop ML network packets (lossy network, netem; default 30%)", 0.6,
               optional=True),
     # Combined failures: several atomic faults at once, each with its own journal entry and TTL.
     FaultSpec("spike_ml_down", ML, "combo", "Traffic spike while the ML service is down", 0.4,
@@ -248,6 +249,12 @@ def undo_entry(ctx, entry: dict, who: str = "main") -> tuple[bool, str]:
 
 # ============================================================== helpers
 def _restore_cpus(ctx, container: str, nano_cpus: int) -> None:
+    """Legacy NanoCpus undo (journals of older versions). Needs a compose recreate on Docker 29.8."""
+    if os.environ.get("SHUTTERSTORM_IN_CONTAINER") == "1":
+        # Inside a container, compose would resolve Immich's relative volume paths against the
+        # container's mount point and recreate the service with wrong paths. Never do that here.
+        raise FaultError(f"cannot remove a --cpus limit on {container} from inside a container; "
+                         "run `python -m shutterstorm panic` on the host")
     try:
         ctx.docker.set_nano_cpus(container, nano_cpus)
     except DockerError as exc:

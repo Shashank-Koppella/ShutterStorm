@@ -5,6 +5,7 @@ from shutterstorm import planner
 from shutterstorm.config import Settings, Thresholds
 from shutterstorm.faults import CATALOG
 from shutterstorm.llm import LLMClient
+from shutterstorm.agentclient import Agents
 from shutterstorm.workflow import Workflow
 
 CAPS = Thresholds()  # configured caps: 75 % errors, 8000 ms p95
@@ -45,13 +46,13 @@ def _scripted_llm(tmp_path, decisions):
 
 def test_ai_decides_what_when_and_how_safely_during_the_run(ctx, tmp_path):
     wf = Workflow(ctx, budget=2)
-    wf.llm = _scripted_llm(tmp_path, [
+    wf.agents = Agents.local(_scripted_llm(tmp_path, [
         # step 1: deviates from the tentative plan, picks a strength and STRICTER limits
         {"fault": "traffic_spike", "reason": "measure load headroom before the hangs",
          "settings": {"workers": 40, "duration_s": 3, "max_error_rate": 0.5}, "safety_reason": "server is critical"},
         # step 2: an illegal choice -> validator rejects it -> deterministic next step
         {"fault": "docker_rm_everything", "reason": "x", "safety_reason": "y"},
-    ])
+    ]))
     run_dir = wf.run()
     data = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))
     assert data["status"] == "completed", data.get("error")
