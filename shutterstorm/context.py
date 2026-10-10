@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -112,11 +113,16 @@ def build_context(settings: Settings) -> Ctx:
             immich_password=sim.PASSWORD, timings=SIM_TIMINGS,
             probe_timeout_seconds=min(settings.probe_timeout_seconds, 1.0),
             max_fault_seconds=min(settings.max_fault_seconds, 8.0),
-            home=settings.home,
+            # Never spend real API calls on fake data unless explicitly asked to.
+            llm_mode=settings.llm_mode if os.environ.get("SHUTTERSTORM_SIM_LLM") else "off",
         )
         print(SIM_BANNER, flush=True)
     console = Console(settings.secrets(), settings.simulate)
     state_dir = settings.state_dir / ("sim" if settings.simulate else "")
     journal = Journal(state_dir)
+    if settings.simulate:
+        # A fresh fake world has nothing to undo; leftovers belong to a dead simulation.
+        for name in ("journal.json", "probe_assets.json", "last_checkpoint.json", "STOP"):
+            (state_dir / name).unlink(missing_ok=True)
     docker = DockerCtl(sim.docker if sim else None, log=console.info)
     return Ctx(settings=settings, docker=docker, journal=journal, console=console, sim=sim)

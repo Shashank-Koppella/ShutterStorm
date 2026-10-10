@@ -149,6 +149,11 @@ class AssetTracker:
             for asset in matches:
                 self.add(asset["id"], filename)
                 found.append(asset["id"])
+            if not matches:  # the search worked and nothing was stored: nothing to clean up
+                with self._lock:
+                    if filename in self.pending:
+                        self.pending.remove(filename)
+                    self._save()
         return found
 
     def cleanup(self, client: ImmichClient) -> dict:
