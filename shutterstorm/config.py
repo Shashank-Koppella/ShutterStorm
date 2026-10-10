@@ -67,7 +67,7 @@ class Settings:
     immich_password: str = ""
     immich_dir: Path = Path(".")
     mistral_api_key: str = ""
-    mistral_model: str = "mistral-small-latest"
+    mistral_model: str = "ministral-8b-latest"
     llm_mode: str = "live"  # live | replay | off
     max_fault_seconds: float = 60.0
     probe_timeout_seconds: float = 10.0
@@ -135,7 +135,7 @@ def load_settings(home: Path | None = None, simulate: bool = False) -> Settings:
         immich_password=values.get("IMMICH_PASSWORD", ""),
         immich_dir=Path(values.get("IMMICH_DIR", ".")).expanduser(),
         mistral_api_key=values.get("MISTRAL_API_KEY", ""),
-        mistral_model=values.get("MISTRAL_MODEL", "mistral-small-latest"),
+        mistral_model=values.get("MISTRAL_MODEL", "ministral-8b-latest"),
         llm_mode=llm_mode,
         max_fault_seconds=float(values.get("MAX_FAULT_SECONDS", 60)),
         probe_timeout_seconds=float(values.get("PROBE_TIMEOUT_SECONDS", 10)),

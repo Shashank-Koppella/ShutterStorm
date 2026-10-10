@@ -126,12 +126,17 @@ def predict(llm: LLMClient, spec: FaultSpec, topology: dict, deterministic: dict
 
 def analyze(llm: LLMClient, exp: dict, topology: dict) -> dict:
     """Explain one experiment. Output schema per the README."""
-    payload = {"dependency_edges": topology["edges"], "baseline_summary": exp["baseline_summary"],
+    payload = {"dependency_edges": [e for e in topology["edges"] if e["source"] != "empirical"],
+               "journeys": JOURNEYS, "baseline_summary": exp["baseline_summary"],
                "heatmap_row": exp["heatmap"], "prediction": exp["prediction"], **evidence_digest(exp)}
-    data, source = _ask(llm, "Analyse this chaos experiment. Schema: {\"predicted_impact\": str (what you would "
-                        "have predicted before injection), \"summary\": str, \"affected_journeys\": [ids], "
-                        "\"root_cause_hypothesis\": str, \"user_visible_symptom\": str, \"severity_rationale\": str}. "
-                        "Pay special attention to the difference between hung (timeout) and fast failures.",
+    data, source = _ask(llm, f"Analyse this ONE chaos experiment: only the fault '{exp['fault']}' was active; no "
+                        "other fault was running. Log tails are the last lines of each container log and may contain "
+                        "older, unrelated lines; only use lines that match the fault window. Heatmap cells: ok, slow, "
+                        "fast-fail (clear error), hung (no answer within the timeout). Schema: {\"predicted_impact\": "
+                        "str (what you would have predicted before injection), \"summary\": str (2-3 sentences), "
+                        "\"affected_journeys\": [ids], \"root_cause_hypothesis\": str, \"user_visible_symptom\": str "
+                        "(what a user of the web app would notice, 1 sentence), \"severity_rationale\": str}. "
+                        "Pay special attention to the difference between hung and fast failures.",
                         payload, check_analysis)
     if data is None:
         return {**fallback_analysis(exp), "source": "fallback"}
