@@ -40,9 +40,11 @@ class Timings:
     poll_s: float = 1.0
     healthy_timeout_s: float = 180.0   # wait for a container to become healthy
     protected_rounds: int = 3
+    round_interval_s: float = 2.0      # minimum time between probe rounds (limits load)
 
 
 SIM_TIMINGS = Timings(
+    round_interval_s=0.1,
     baseline_rounds=2,
     fault_window_s=2.5,
     settle_s=0.2,

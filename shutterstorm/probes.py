@@ -267,7 +267,10 @@ class Prober:
         return res
 
     def j3_smart_search(self, phase: str = "") -> ProbeResult:
-        res, _ = self._timed("J3", phase, lambda: self.client().smart_search("tree", size=10))
+        # Immich caches the CLIP embedding per query text, so a repeated query never
+        # reaches the ML service. Every probe therefore uses a unique query.
+        query = f"tree {os.urandom(4).hex()}"
+        res, _ = self._timed("J3", phase, lambda: self.client().smart_search(query, size=10))
         return res
 
     def upload_chain(self, phase: str, async_deadline: float, journeys: tuple[str, ...]) -> list[ProbeResult]:
@@ -335,7 +338,7 @@ class Prober:
     def warmup(self) -> None:
         """One untimed smart search so a cold ML model does not distort the baseline."""
         try:
-            self.client().smart_search("tree", timeout=max(self.timeout, 60))
+            self.client().smart_search(f"tree warmup {time.time()}", timeout=max(self.timeout, 60))
         except requests.RequestException:
             pass
 

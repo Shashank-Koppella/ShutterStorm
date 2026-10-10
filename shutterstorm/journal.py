@@ -91,6 +91,15 @@ class Journal:
         with self._locked():
             self._write([e for e in self._read() if e["id"] != entry_id])
 
+    def reassign_pid(self, entry_id: str, pid: int) -> None:
+        """Change the owner pid of an entry (used by the simulated guard drill)."""
+        with self._locked():
+            entries = self._read()
+            for e in entries:
+                if e["id"] == entry_id:
+                    e["pid"] = pid
+            self._write(entries)
+
     def entries(self) -> list[dict]:
         with self._locked():
             return self._read()

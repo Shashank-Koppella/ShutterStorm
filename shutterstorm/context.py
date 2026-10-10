@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -115,7 +114,7 @@ def build_context(settings: Settings) -> Ctx:
             max_fault_seconds=min(settings.max_fault_seconds, 8.0),
             home=settings.home,
         )
-        print(SIM_BANNER, file=sys.stderr if not sys.stdout else sys.stdout, flush=True)
+        print(SIM_BANNER, flush=True)
     console = Console(settings.secrets(), settings.simulate)
     state_dir = settings.state_dir / ("sim" if settings.simulate else "")
     journal = Journal(state_dir)

@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
+import time
 from argparse import Namespace
 
+from .checkpoint import preflight_problems, take_checkpoint, verify_cleanup
 from .config import CORE_CONTAINERS, COMPOSE_PROJECT, Settings
-from .context import Ctx, build_context
-from .probes import AssetTracker, Prober
+from .context import Ctx, build_context, write_json
+from .experiment import run_experiment
+from .faults import apply_fault, get_fault
+from .probes import AssetTracker, Prober, ProbeResult
 from .reporting_io import append_probes_csv, summary_table
+from .safety import AbortRun, panic
 
 
 def _ctx(settings: Settings) -> Ctx:
@@ -84,5 +91,134 @@ def cmd_baseline(settings: Settings, args: Namespace) -> int:
         ctx.log(f"probe assets deleted: {cleanup['deleted']}, remaining: {len(cleanup['remaining'])}")
         ctx.log(f"saved {run_dir}")
         return 0 if all(r.ok for r in results) else 1
+    finally:
+        ctx.close()
+
+
+# ------------------------------------------------------------------------ inject
+def print_round(ctx: Ctx):
+    """Callback that logs one line per probe round."""
+    def _cb(phase: str, n: int, results) -> None:
+        ctx.log(f"{phase:<8} round {n}: " + "  ".join(
+            f"{r.journey}={r.outcome}({r.latency_ms / 1000:.1f}s)" for r in results))
+    return _cb
+
+
+def cmd_inject(settings: Settings, args: Namespace) -> int:
+    """Day-1 deliverable: one fault with journal, guard, TTL and Ctrl+C kill switch."""
+    spec = get_fault(args.fault)
+    ctx = _ctx(settings)
+    run_dir = None
+    checkpoint = None
+    prober = None
+    status = 0
+    try:
+        ctx.journal.clear_stop()
+        problems = preflight_problems(ctx)
+        if problems:
+            for p in problems:
+                ctx.log(f"not clean: {p}")
+            return 2
+        run_dir = ctx.new_run_dir(f"inject-{spec.id}")
+        checkpoint = take_checkpoint(ctx, run_dir)
+        prober = make_prober(ctx, run_dir.name)
+        prober.warmup()
+        base = prober.run_round("baseline", async_deadline=ctx.settings.timings.async_deadline_s)
+        print_round(ctx)("baseline", 1, base)
+        ctx.log(f"Injecting {spec.id} for {args.duration:.0f}s. Kill switches: Ctrl+C, "
+                f"`python -m shutterstorm panic`, or create {ctx.journal.stop_path}")
+        ev = run_experiment(ctx, prober, spec, run_dir, window_s=args.duration, on_round=print_round(ctx))
+        print("\nDuring the fault:")
+        print(summary_table([ProbeResult(**r) for r in ev["fault_results"]]))
+        rec = "not within limit" if ev["recovery_s"] is None else f"{ev['recovery_s']}s after undo"
+        ctx.log(f"recovery: {rec}; uploads stored {ev['integrity']['stored']}/{ev['integrity']['attempted']}, "
+                f"intact {ev['integrity']['intact']}, ghost uploads {ev['integrity']['ghost_uploads']}")
+    except AbortRun as exc:
+        ctx.log(f"ABORT: {exc}")
+        panic(ctx, reason=str(exc))
+        status = 3
+    except KeyboardInterrupt:
+        ctx.log("Ctrl+C received: fault already undone by the experiment's cleanup path")
+        status = 130
+    finally:
+        if checkpoint is not None:
+            result = verify_cleanup(ctx, checkpoint, prober.tracker if prober else None)
+            write_json(run_dir / "cleanup.json", result)
+            for c in result["checks"]:
+                if not c["ok"]:
+                    ctx.log(f"cleanup check FAILED: {c['name']} ({c['detail']})")
+            ctx.log(f"cleanup verification: {'PASS' if result['ok'] else 'FAIL'} ({len(result['checks'])} checks)")
+            status = status or (0 if result["ok"] else 4)
+        ctx.close()
+    return status
+
+
+# ------------------------------------------------------------------------ kill switches
+def cmd_panic(settings: Settings, args: Namespace) -> int:
+    ctx = _ctx(settings)
+    try:
+        result = panic(ctx, reason="manual panic command")
+        return 0 if result["journal_left"] == 0 else 1
+    finally:
+        ctx.close()
+
+
+def cmd_stop(settings: Settings, args: Namespace) -> int:
+    ctx = _ctx(settings)
+    ctx.journal.request_stop()
+    print(f"STOP file created: {ctx.journal.stop_path}. A running workflow stops at its next step.")
+    ctx.close()
+    return 0
+
+
+# ------------------------------------------------------------------------ drill
+def cmd_drill(settings: Settings, args: Namespace) -> int:
+    """Inject a fault, kill the process that owns it, and watch the guard restore it."""
+    spec = get_fault(args.fault)
+    ctx = _ctx(settings)
+    try:
+        ctx.journal.clear_stop()
+        problems = preflight_problems(ctx)
+        if problems:
+            for p in problems:
+                ctx.log(f"not clean: {p}")
+            return 2
+        take_checkpoint(ctx)
+        ctx.log(f"GUARD DRILL: inject {spec.id}, then kill the owning process without any cleanup")
+        if ctx.simulate:
+            active = apply_fault(ctx, spec)
+            active._timer.cancel()  # a dead process has no watchdog thread either
+            time.sleep(1)
+            ctx.log("simulated crash: owner process is gone (pid 0), TTL watchdog gone")
+            ctx.journal.reassign_pid(active.entry_id, 0)
+        else:
+            child = subprocess.Popen([sys.executable, "-m", "shutterstorm", "inject", spec.id, "--duration", "50"],
+                                     cwd=str(ctx.settings.home))
+            deadline = time.time() + 120
+            while time.time() < deadline and not ctx.journal.entries():
+                time.sleep(0.5)
+            if not ctx.journal.entries():
+                child.kill()
+                ctx.log("child never applied the fault; drill aborted")
+                return 1
+            time.sleep(6)
+            ctx.log(f">>> KILLING main process pid {child.pid} (no cleanup code will run) <<<")
+            child.kill()
+            child.wait()
+        start = time.time()
+        while time.time() - start < 120:
+            st = ctx.docker.state(spec.container)
+            left = ctx.journal.entries()
+            ctx.log(f"t+{time.time() - start:4.0f}s  {spec.container}: running={st['running']} "
+                    f"paused={st['paused']}  journal entries={len(left)}")
+            if not left and st["running"] and not st["paused"]:
+                break
+            time.sleep(ctx.settings.timings.poll_s * 2)
+        ok = not ctx.journal.entries() and not ctx.docker.state(spec.container)["paused"]
+        if ok:
+            ctx.docker.wait_healthy(spec.container, ctx.settings.timings.healthy_timeout_s)
+            AssetTracker(ctx.journal.state_dir / "probe_assets.json").cleanup(ctx.admin(fresh=True))
+        ctx.log(f"GUARD DRILL {'PASSED: the guard restored the system' if ok else 'FAILED'}")
+        return 0 if ok else 1
     finally:
         ctx.close()
