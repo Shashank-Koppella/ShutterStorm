@@ -20,6 +20,7 @@ import traceback
 from pathlib import Path
 
 from . import agents
+from .approval import Approver, build_request
 from .checkpoint import changed_files, hash_dir, preflight_problems, take_checkpoint, verify_cleanup
 from .config import ML2, OVERRIDE_FILE
 from .context import Ctx, write_json
@@ -38,17 +39,24 @@ from .topology import (JOURNEY_DEPS, add_empirical_edges, discover, predict_impa
 
 CELL_RANK = {"hung": 0, "fast-fail": 1, "slow": 2, "ok": 3, "n/a": 3}
 MIN_SCORE_GAIN = 10.0
+class OperatorQuit(AbortRun):
+    """The operator answered 'q' at an approval prompt."""
+
+
 RAW_KEYS = ("fault_results", "recovery_results")
 
 
 class Workflow:
     """Runs the full chaos workflow once and writes everything into ``runs/<id>/``."""
 
-    def __init__(self, ctx: Ctx, experiments: list[str], repair: bool = False, keep_fix: bool = False) -> None:
+    def __init__(self, ctx: Ctx, experiments: list[str], repair: bool = False, keep_fix: bool = False,
+                 approver: Approver | None = None) -> None:
         self.ctx = ctx
         self.specs: list[FaultSpec] = [get_fault(f) for f in experiments]  # rejects unknown faults up front
         self.repair = repair
         self.keep_fix = keep_fix
+        # Repair patches need approval: "ask" prompts the operator, "yes" (--yes) auto-approves.
+        self.approver = approver or Approver("ask", out=ctx.log)
         self.llm = LLMClient(ctx.settings, ctx.log)
         self.run_dir: Path | None = None
         self.prober: Prober | None = None
@@ -104,11 +112,15 @@ class Workflow:
 
             for spec in self.specs:
                 exp = self.run_one(spec)
+                self.experiments.append(exp)  # recorded even if the repair loop is quit/aborted
                 if self.repair and exp["actual_impacted"]:
                     exp["repair"] = self.repair_loop(spec, exp)
-                self.experiments.append(exp)
                 self._save_findings()
             self.status = "completed"
+        except OperatorQuit as exc:
+            # Nothing is applied while the prompt waits, so a normal cleanup is enough (no panic).
+            self.status, self.error = "stopped by operator", str(exc)
+            ctx.log(f"STOPPED: {exc}")
         except AbortRun as exc:
             self.status, self.error = "aborted", str(exc)
             ctx.log(f"ABORTED: {exc}")
@@ -182,7 +194,24 @@ class Workflow:
                 ctx.log(f"   patch REJECTED by validator: {errors}")
                 attempts.append({**attempt, "result": "rejected", "errors": errors})
                 continue
-            ctx.log("   patch:\n" + "\n".join("      " + line for line in attempt["diff"].splitlines()))
+            # Human-in-the-loop: explain the issue and the fix, and ask before touching anything.
+            decision = self.approver.request(build_request(exp, attempt, n, ctx.settings.max_repair_attempts))
+            attempt["approval"] = decision
+            ctx.log(f"   approval: {decision['decision']} (by {decision['by']} at {decision['at']})")
+            if decision["decision"] != "approve":
+                result = {"decline": "declined by operator", "skip": "skipped by operator",
+                          "quit": "operator quit the run", "not_approved": "not approved"}[decision["decision"]]
+                attempts.append({**attempt, "result": result, "reasons": [result]})
+                self._save_findings()
+                if decision["decision"] == "decline":
+                    continue  # the agent sees this in `previous_attempts` and proposes something else
+                if decision["decision"] == "quit":
+                    exp["repair"] = {"status": "operator_quit", "attempts": attempts, "source": proposal["source"],
+                                     "recommendation": agents.CODE_LEVEL_FIXES.get(spec.service, "")}
+                    raise OperatorQuit("operator quit the run at a repair approval prompt")
+                status = "skipped_by_operator" if decision["decision"] == "skip" else "not_approved"
+                return {"status": status, "attempts": attempts, "source": proposal["source"],
+                        "recommendation": agents.CODE_LEVEL_FIXES.get(spec.service, "")}
             attempt.update(self.test_patch(spec, exp, patch, n))
             attempts.append(attempt)
             self._save_findings()

@@ -96,7 +96,9 @@ def render_markdown(data: dict) -> str:
             note = "" if r["status"] == "verified" else " _(AI suggestion, not verified by a test)_"
             out.append(f"- **Repair:** {r['status']} after {len(r.get('attempts', []))} attempt(s). {r.get('recommendation', '')}{note}")
             for att in r.get("attempts", []):
-                out.append(f"  - attempt {att['n']} ({att.get('source')}): {att.get('result')} "
+                appr = att.get("approval")
+                appr_txt = f" [approval: {appr['decision']} by {appr['by']} at {appr['at']}]" if appr else ""
+                out.append(f"  - attempt {att['n']} ({att.get('source')}){appr_txt}: {att.get('result')} "
                            f"{'; '.join(att.get('reasons', []) or att.get('errors', []))}")
                 out.append("    ```\n" + "\n".join("    " + line for line in att.get("diff", "").splitlines()) + "\n    ```")
         out.append("")
@@ -221,7 +223,10 @@ AI-generated.</p></div></div>"""]
             parts.append(f"<p><b>Repair loop: {_e(r['status'])}</b>{badge(r.get('source'))} {_e(r.get('recommendation'))}{note}</p>")
             for att in r.get("attempts", []):
                 why = "; ".join(att.get("reasons", []) or att.get("errors", []))
-                parts.append(f"<p>Attempt {att['n']}{badge(att.get('source'))}: <b>{_e(att.get('result'))}</b> "
+                appr = att.get("approval")
+                appr_txt = (f" <span class='muted'>(approval: {_e(appr['decision'])} by {_e(appr['by'])} at "
+                            f"{_e(appr['at'])})</span>") if appr else ""
+                parts.append(f"<p>Attempt {att['n']}{badge(att.get('source'))}{appr_txt}: <b>{_e(att.get('result'))}</b> "
                              f"{_e(why)} {('&middot; re-test score ' + _e(att.get('retest_score')) + ' (' + _e(att.get('score_delta')) + ')') if 'retest_score' in att else ''}"
                              f"<br><span class='muted'>{_e(att.get('rationale'))}</span></p><pre>{_e(att.get('diff'))}</pre>")
                 if att.get("retest_heatmap"):

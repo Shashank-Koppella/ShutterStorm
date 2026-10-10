@@ -49,7 +49,9 @@ flowchart LR
    docker action) → **observe** ~35 s of concurrent probe rounds + queue snapshots + log tails → **undo and
    verify** → measure **recovery** → check **integrity** of uploads made during the fault (including ghost
    uploads found by file name).
-5. **Score** (math), **analyse** (Analyst), optional **repair loop**, then the **report** (Reporter).
+5. **Score** (math), **analyse** (Analyst), optional **repair loop**, then the **report** (Reporter). In the
+   repair loop every validated patch is shown to the operator (issue, fix, side effects, test plan) and is only
+   applied after `y` at the CLI prompt (or `--yes`).
 6. **Restore and verify cleanup**: always (`finally`), also after an error, STOP or Ctrl+C.
 
 ## Where AI is used, and where it is not
@@ -61,6 +63,7 @@ flowchart LR
 | Writing the report | Reporter | must keep the math's order and severities |
 | Fault choice, injection, undo, timing | **no** | fixed catalog, deterministic code |
 | Patch validation, pass/fail, retries | **no** | fail-closed validator + measured criteria |
+| Applying a patch at all | **human** | operator approval prompt (`y/n/s/q`), or explicit `--yes` |
 | Ranking and resilience score | **no** | `scoring.py` formula |
 
 Every AI output is schema-checked (one retry on invalid JSON, then a deterministic fallback) and tagged

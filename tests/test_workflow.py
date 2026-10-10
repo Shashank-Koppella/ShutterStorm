@@ -2,11 +2,14 @@
 import json
 
 from shutterstorm.config import ML2, OVERRIDE_FILE
+from shutterstorm.approval import Approver
 from shutterstorm.workflow import Workflow
+
+YES = Approver("yes", out=lambda text: None)
 
 
 def test_full_workflow_with_repair(ctx):
-    wf = Workflow(ctx, ["ml_pause", "redis_pause", "ml_stop"], repair=True)
+    wf = Workflow(ctx, ["ml_pause", "redis_pause", "ml_stop"], repair=True, approver=YES)
     run_dir = wf.run()
     data = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))
 
@@ -42,7 +45,7 @@ def test_full_workflow_with_repair(ctx):
 
 def test_repair_attempts_are_not_repeated(ctx):
     """ml_stop: the failover patch improves less than the bar, so later attempts must differ, then give up."""
-    wf = Workflow(ctx, ["ml_stop"], repair=True)
+    wf = Workflow(ctx, ["ml_stop"], repair=True, approver=YES)
     run_dir = wf.run()
     exp = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))["experiments"][0]
     proposed = [json.dumps(a["proposed"], sort_keys=True) for a in exp["repair"]["attempts"]]
@@ -69,7 +72,7 @@ def test_stop_file_aborts_and_cleans_up(ctx):
 
 
 def test_keep_fix_leaves_patch_applied(ctx):
-    wf = Workflow(ctx, ["ml_pause"], repair=True, keep_fix=True)
+    wf = Workflow(ctx, ["ml_pause"], repair=True, keep_fix=True, approver=YES)
     run_dir = wf.run()
     data = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))
     assert data["experiments"][0]["repair"]["kept"] is True

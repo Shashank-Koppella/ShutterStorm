@@ -358,7 +358,10 @@ def fallback_report(items: list[dict], overall: float | None) -> dict:
     findings = []
     for i in items:
         status = {"verified": "fixed (verified patch)", "unresolved": "unresolved",
-                  "no_fix_possible": "unresolved (code-level fix needed)"}.get(i["repair"] or "", "not attempted")
+                  "no_fix_possible": "unresolved (code-level fix needed)",
+                  "skipped_by_operator": "repair skipped by operator",
+                  "not_approved": "fix proposed, not approved (no operator)",
+                  "operator_quit": "run stopped by operator"}.get(i["repair"] or "", "not attempted")
         findings.append({
             "id": i["id"], "title": f"{i['fault']}: {i['analysis']['user_visible_symptom'][:90]}",
             "severity": i["severity"], "evidence": i["analysis"]["summary"],

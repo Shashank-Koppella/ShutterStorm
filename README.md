@@ -105,7 +105,7 @@ python -m pytest -q            # 53 tests, all in simulation
 | `seed --dir P` | upload a folder of images (e.g. COCO128) as test content; duplicates are skipped |
 | `baseline` | probes only, healthy state |
 | `inject F --duration S` | one fault with kill switch + TTL + guard (the Day-1 deliverable) |
-| `run [--experiments a,b] [--repair] [--keep-fix]` | full workflow; default set: ml_pause, ml_stop, redis_pause, redis_stop, db_pause, server_restart |
+| `run [--experiments a,b] [--repair] [--keep-fix] [--yes]` | full workflow; default set: ml_pause, ml_stop, redis_pause, redis_stop, db_pause, server_restart. With `--repair`, every proposed fix is explained in the terminal and needs your approval (`y`/`n`/`s`/`q`); `--yes` auto-approves |
 | `panic` | kill switch: undo everything, restore the last checkpoint |
 | `stop` | create the STOP file; a running workflow stops at its next step |
 | `drill` | guard drill: inject ml_pause, hard-kill the owning process, watch the guard restore |
@@ -133,13 +133,14 @@ ShutterStorm only ever touches **our own sandbox**:
 6. **Kill switches**: Ctrl+C, `python -m shutterstorm panic`, and the `.shutterstorm/STOP` file (checked between
    every step).
 7. **Abort rule**: if liveness (J0) fails for more than 30 s after an undo, the run stops and runs panic.
-8. **Fail-closed repair validator**: only the knobs in `list` are accepted (e.g. ML URLs from a fixed list, job
+8. **Operator approval for every fix**: before a repair patch is applied, the CLI shows the issue (measured), the proposed fix (who proposed it, the exact changes, side effects) and how it will be tested, and asks `Apply this fix? [y/n/s/q]`. Without an interactive terminal nothing is applied unless you pass `--yes`. The decision is recorded in the report.
+9. **Fail-closed repair validator**: only the knobs in `list` are accepted (e.g. ML URLs from a fixed list, job
    concurrency 1-8, a second ML instance with a fixed shape). We never edit `docker-compose.yml` or `.env`; the
    only file we may write is `docker-compose.shutterstorm.yml`, and a hash of every file in `IMMICH_DIR` proves it.
-9. **Cleanup verification** after every run (shown in the report): containers healthy and unpaused, CPU limits,
+10. **Cleanup verification** after every run (shown in the report): containers healthy and unpaused, CPU limits,
    no helpers, no netem, system-config identical to the checkpoint, override file restored, probe assets
    deleted (only ours: by ID **and** `shutterstorm-probe-` file name), journal empty.
-10. **Where AI is (not) used**: the LLM predicts, explains, proposes patches and writes prose. It never runs
+11. **Where AI is (not) used**: the LLM predicts, explains, proposes patches and writes prose. It never runs
     commands, never decides whether a patch passed, and never ranks findings. Only sandbox evidence is sent;
     secrets and tokens are redacted.
 

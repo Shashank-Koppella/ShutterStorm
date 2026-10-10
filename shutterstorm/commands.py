@@ -257,7 +257,12 @@ def cmd_run(settings: Settings, args: Namespace) -> int:
         get_fault(fault_id)  # reject unknown faults before touching anything
     ctx = _ctx(settings)
     try:
-        wf = Workflow(ctx, experiments, repair=args.repair, keep_fix=args.keep_fix)
+        from .approval import Approver
+
+        approver = Approver("yes" if args.yes else "ask", out=ctx.log)
+        if args.repair and not args.yes and not approver.interactive:
+            ctx.log("note: no interactive terminal, so repair patches will be proposed but NOT applied (use --yes)")
+        wf = Workflow(ctx, experiments, repair=args.repair, keep_fix=args.keep_fix, approver=approver)
         run_dir = wf.run()
         print(f"\nstatus: {wf.status}   overall score: "
               f"{json.loads((run_dir / 'findings.json').read_text(encoding='utf-8')).get('overall_score')}")
@@ -333,16 +338,50 @@ def cmd_seed(settings: Settings, args: Namespace) -> int:
     try:
         client = ctx.admin()
         exts = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
-        files = sorted(p for p in args.dir.rglob("*") if p.suffix.lower() in exts)
+        # "._name.jpg" files are macOS metadata (from zips made on a Mac), not images.
+        files = sorted(p for p in args.dir.rglob("*") if p.suffix.lower() in exts and not p.name.startswith("._"))
         if args.limit:
             files = files[:args.limit]
         created = dup = failed = 0
-        for path in files:
-            resp = client.upload(path.read_bytes(), path.name, timeout=60)
+        latencies: list[float] = []
+        total_bytes = 0
+        start = time.perf_counter()
+        for i, path in enumerate(files, 1):
+            data = path.read_bytes()
+            t0 = time.perf_counter()
+            resp = client.upload(data, path.name, timeout=60)
+            latencies.append((time.perf_counter() - t0) * 1000)
+            total_bytes += len(data)
             created += resp.status_code == 201
             dup += resp.status_code == 200
             failed += resp.status_code not in (200, 201)
+            if i % 20 == 0 or i == len(files):
+                ctx.log(f"  {i}/{len(files)} uploaded ({time.perf_counter() - start:.1f}s)")
+        elapsed = time.perf_counter() - start
+        from .probes import percentile
+
         ctx.log(f"seeded {args.dir}: {created} new, {dup} duplicates skipped, {failed} failed")
+        if files:
+            ctx.log(f"upload time: {elapsed:.1f}s total for {len(files)} files ({total_bytes / 1e6:.1f} MB), "
+                    f"{len(files) / elapsed:.1f} files/s, per file p50 {percentile(latencies, 50):.0f} ms, "
+                    f"p95 {percentile(latencies, 95):.0f} ms")
+        if args.wait and files:
+            wait_for_queues(ctx, client, start)
         return 0 if not failed else 1
     finally:
         ctx.close()
+
+
+def wait_for_queues(ctx: Ctx, client, upload_start: float, limit_s: float = 1800) -> None:
+    """Poll GET /api/queues until no job is waiting or active (thumbnails, ML, OCR...)."""
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < limit_s:
+        busy = {q["name"]: q["statistics"]["waiting"] + q["statistics"]["active"] for q in client.queues()}
+        busy = {k: v for k, v in busy.items() if v}
+        if not busy:
+            ctx.log(f"all background jobs done: {time.perf_counter() - t0:.1f}s after the last upload, "
+                    f"{time.perf_counter() - upload_start:.1f}s after the first upload")
+            return
+        ctx.log("  still processing: " + ", ".join(f"{k}={v}" for k, v in sorted(busy.items())))
+        time.sleep(5)
+    ctx.log(f"queues not empty after {limit_s:.0f}s; stopped waiting")

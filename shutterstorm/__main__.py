@@ -25,6 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("seed", "upload a folder of images as test content")
     p.add_argument("--dir", required=True, type=Path)
     p.add_argument("--limit", type=int, default=0, help="max images (0 = all)")
+    p.add_argument("--wait", action="store_true", help="also wait until thumbnails/ML jobs finish and time it")
     p = add("baseline", "run all probes in a healthy state")
     p.add_argument("--rounds", type=int, default=None)
     p = add("inject", "inject one fault with TTL + kill switch")
@@ -34,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--experiments", default="", help="comma-separated fault ids")
     p.add_argument("--repair", action="store_true", help="let the Repair agent try config-level fixes")
     p.add_argument("--keep-fix", action="store_true", help="leave a verified patch applied")
+    p.add_argument("--yes", action="store_true",
+                   help="approve every repair patch without asking (default: ask in the terminal)")
     add("panic", "kill switch: undo everything and restore the checkpoint")
     p = add("drill", "guard drill: inject ml_pause, kill the main process, watch the guard restore")
     p.add_argument("--fault", default="ml_pause")
