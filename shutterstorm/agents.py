@@ -1,4 +1,6 @@
-"""The three LLM agents (Analyst, Fix Advisor, Reporter) and their deterministic fallbacks.
+"""The LLM agents (Analyst, Fix Advisor, Reporter) and their deterministic fallbacks.
+
+The fourth agent, the experiment Planner, lives in :mod:`shutterstorm.planner`.
 
 The agents only *explain* and *propose*. They never decide whether a patch
 passed, never rank findings (the scoring math does), and never run commands.
@@ -176,6 +178,16 @@ ROOT_CAUSES = {
                     "turns into a fast 500 - but the web UI shows it as 'no results', which is misleading.",
     ("ml", "cpu"): "ML inference is CPU-bound; a CPU limit makes each embedding slower.",
     ("ml", "latency"): "Every ML call pays the injected network delay; there is no fast fallback.",
+    ("ml", "loss"): "Dropped packets force TCP retransmissions on every ML call, so smart search becomes slow or "
+                    "times out instead of failing over.",
+    ("database", "cpu"): "Every authenticated request runs Postgres queries; with a CPU limit queries queue up, so "
+                         "DB-bound journeys slow down roughly in proportion to their query cost.",
+    ("server", "load"): "All traffic goes through one API server process and one Postgres connection pool; a burst of "
+                        "concurrent clients queues requests in the pool, so DB-heavy and ML journeys slow down first.",
+    ("ml", "combo"): "Two faults at once: the spike fills the server's request queue while ML is down, so smart search "
+                     "errors and the remaining journeys compete for the same server and database.",
+    ("redis", "combo"): "Two faults at once: uploads block on the frozen job queue while the spike keeps the server "
+                        "busy, so blocked upload requests and spike traffic compete for the same server.",
     ("redis", "pause"): "Uploads store the file and DB row, then enqueue BullMQ jobs in Redis. On a frozen Redis the "
                         "enqueue blocks with no timeout, so the HTTP response never arrives although the asset exists "
                         "(a 'ghost upload'); thumbnails wait until Redis returns.",

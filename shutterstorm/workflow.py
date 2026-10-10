@@ -2,9 +2,11 @@
 
     check environment, scope, clean checkpoint
       -> discover dependency map
+      -> AI experiment planner: rank + select faults from the map (unless --experiments is given)
       -> baseline tests
-      -> for each fault:
-           predict -> inject (journal + TTL + guard) -> observe -> undo + verify
+      -> for each planned fault:
+           predict -> inject (journal + TTL + guard) -> observe (threshold monitor: auto-rollback)
+           -> undo + verify
            -> recovery + integrity -> score (math) -> explain (Analyst)
            -> suggest a fix (Fix Advisor) -> check the suggestion against the allowed settings
       -> restore test environment + verify cleanup   (always: also on error, STOP, Ctrl+C)
@@ -12,8 +14,8 @@
 
 ShutterStorm only injects faults and undoes them. It never applies a fix: suggestions are
 shown in the CLI and in the report for a human to decide on. Control flow, injection, undo,
-scoring and cleanup are deterministic code; LLMs are used only in agents.predict / analyze /
-suggest_fix / write_report.
+scoring and cleanup are deterministic code; LLMs are used only in planner.plan and
+agents.predict / analyze / suggest_fix / write_report.
 """
 from __future__ import annotations
 
@@ -21,8 +23,10 @@ import time
 import traceback
 from pathlib import Path
 
-from . import agents
+from . import agents, planner
 from .checkpoint import preflight_problems, take_checkpoint, verify_cleanup
+from .compare import compare_runs
+from .config import Thresholds
 from .context import Ctx, write_json
 from .experiment import run_experiment
 from .faults import FaultSpec, get_fault, undo_entry
@@ -42,9 +46,17 @@ RAW_KEYS = ("fault_results", "recovery_results")
 class Workflow:
     """Runs the full chaos workflow once and writes everything into ``runs/<id>/``."""
 
-    def __init__(self, ctx: Ctx, experiments: list[str], suggest: bool = True) -> None:
+    def __init__(self, ctx: Ctx, experiments: list[str] | None = None, suggest: bool = True,
+                 budget: int = planner.DEFAULT_BUDGET, thresholds: Thresholds | None = None,
+                 compare_to: str | None = None) -> None:
         self.ctx = ctx
-        self.specs: list[FaultSpec] = [get_fault(f) for f in experiments]  # rejects unknown faults up front
+        # Explicit experiments skip the planner; unknown faults are rejected up front.
+        self.specs: list[FaultSpec] = [get_fault(f) for f in experiments or []]
+        self.use_planner = not self.specs
+        self.budget = budget
+        self.thresholds = thresholds or ctx.settings.thresholds
+        self.compare_to = compare_to
+        self.plan: dict = {}
         self.suggest = suggest
         self.llm = LLMClient(ctx.settings, ctx.log)
         self.run_dir: Path | None = None
@@ -82,6 +94,9 @@ class Workflow:
             self.topology = discover(ctx)
             write_json(self.run_dir / "topology.json", self.topology)
             ctx.log(f"   undeclared dependencies: {self.topology['undeclared_dependencies']}")
+
+            self.step("AI experiment planner" if self.use_planner else "Experiments chosen by the operator")
+            self.make_plan()
 
             self.step("Baseline tests")
             self.prober = Prober(ctx.settings, AssetTracker(ctx.journal.state_dir / "probe_assets.json"),
@@ -124,12 +139,30 @@ class Workflow:
         return self.run_dir
 
     # ---------------------------------------------------------------- one experiment
+    def make_plan(self) -> None:
+        ctx = self.ctx
+        if self.use_planner:
+            self.plan = planner.plan(ctx, self.llm, self.topology, self.budget)
+            self.specs = planner.spec_list(self.plan)
+        else:
+            self.plan = {"source": "operator", "strategy": "experiments given with --experiments", "items": [
+                {"rank": n, "fault": s.id, "reason": "chosen by the operator", "failure_class": planner.FAILURE_CLASS[s.kind]}
+                for n, s in enumerate(self.specs, 1)], "skipped": []}
+        write_json(self.run_dir / "plan.json", self.plan)
+        who = {"live": "AI planner (live)", "cache": "AI planner (cached)", "fallback": "deterministic planner",
+               "operator": "operator"}[self.plan["source"]]
+        ctx.log(f"   plan by {who}: {self.plan.get('strategy', '')}")
+        for item in self.plan["items"]:
+            ctx.log(f"   {item['rank']}. {item['fault']:<17} [{item['failure_class']}] {item['reason']}")
+        ctx.log(f"   safety thresholds: {self.thresholds.describe()}")
+
     def run_one(self, spec: FaultSpec) -> dict:
         self.step(f"Inject approved fault: {spec.id}")
         deterministic = predict_impact(spec, self.topology)
         prediction = agents.predict(self.llm, spec, self.topology, deterministic)
         self.ctx.log(f"   predicted impact ({prediction['source']}): {prediction['predicted_impacted']}")
-        ev = run_experiment(self.ctx, self.prober, spec, self.run_dir, on_round=self._on_round)
+        ev = run_experiment(self.ctx, self.prober, spec, self.run_dir, on_round=self._on_round,
+                            thresholds=self.thresholds)
         exp = self.build_record(ev, spec, prediction)
         self.step(f"Confirm failure and capture evidence: {spec.id}")
         self.ctx.log(f"   heatmap: {exp['heatmap']}  score {exp['scoring']['score']}  "
@@ -240,6 +273,8 @@ class Workflow:
             "finished": time.time(),
             "llm_mode": self.ctx.settings.llm_mode,
             "suggestions_enabled": self.suggest,
+            "plan": {k: v for k, v in self.plan.items() if k != "candidates"},
+            "thresholds": self.thresholds.describe(),
             "steps": self.steps,
             "baseline_summary": summarize_dicts(self.baseline),
             "topology": self.topology,
@@ -258,6 +293,11 @@ class Workflow:
                                                  data["scorecard"], MANUAL_FINDINGS) if self.experiments else {}
             data["cleanup"] = self.cleanup
             data["llm_stats"] = {**self.llm.stats, "api_calls": self.llm.calls}
+            if self.compare_to and self.experiments:
+                try:
+                    data["comparison"] = compare_runs(self.ctx.settings, self.compare_to, data)
+                except Exception as exc:  # noqa: BLE001 - a bad --compare-to must not lose the run
+                    data["comparison"] = {"error": f"could not compare with {self.compare_to}: {exc}"}
         write_json(self.run_dir / "findings.json", data)
 
 

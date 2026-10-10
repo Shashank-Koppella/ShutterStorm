@@ -8,8 +8,10 @@ import sys
 import time
 from argparse import Namespace
 
+from dataclasses import replace
+
 from .checkpoint import preflight_problems, take_checkpoint, verify_cleanup
-from .config import CORE_CONTAINERS, COMPOSE_PROJECT, Settings
+from .config import CORE_CONTAINERS, COMPOSE_PROJECT, Settings, Thresholds
 from .context import Ctx, build_context, write_json
 from .experiment import run_experiment
 from .faults import apply_fault, get_fault
@@ -20,6 +22,15 @@ from .safety import AbortRun, panic
 
 def _ctx(settings: Settings) -> Ctx:
     return build_context(settings)
+
+
+def thresholds_from(settings: Settings, args: Namespace) -> Thresholds:
+    """Settings thresholds with any CLI overrides applied."""
+    t = settings.thresholds
+    overrides = {"max_error_rate": getattr(args, "max_error_rate", None), "max_p95_ms": getattr(args, "max_p95_ms", None),
+                 "rounds": getattr(args, "breach_rounds", None)}
+    t = replace(t, **{k: v for k, v in overrides.items() if v is not None})
+    return replace(t, blast_radius=False) if getattr(args, "no_blast_radius", False) else t
 
 
 def make_prober(ctx: Ctx, run_tag: str) -> Prober:
@@ -126,9 +137,14 @@ def cmd_inject(settings: Settings, args: Namespace) -> int:
         prober.warmup()
         base = prober.run_round("baseline", async_deadline=ctx.settings.timings.async_deadline_s)
         print_round(ctx)("baseline", 1, base)
+        limits = thresholds_from(settings, args)
         ctx.log(f"Injecting {spec.id} for {args.duration:.0f}s. Kill switches: Ctrl+C, "
                 f"`python -m shutterstorm panic`, or create {ctx.journal.stop_path}")
-        ev = run_experiment(ctx, prober, spec, run_dir, window_s=args.duration, on_round=print_round(ctx))
+        ctx.log(f"Automatic rollback if {limits.describe()}")
+        ev = run_experiment(ctx, prober, spec, run_dir, window_s=args.duration, on_round=print_round(ctx),
+                            thresholds=limits)
+        if ev["auto_stopped"]:
+            ctx.log(f"AUTO-STOPPED after {ev['auto_stopped']['after_s']}s: {ev['auto_stopped']['reason']}")
         print("\nDuring the fault:")
         print(summary_table([ProbeResult(**r) for r in ev["fault_results"]]))
         rec = "not within limit" if ev["recovery_s"] is None else f"{ev['recovery_s']}s after undo"
@@ -252,12 +268,15 @@ def cmd_run(settings: Settings, args: Namespace) -> int:
     from .faults import DEFAULT_EXPERIMENTS
     from .workflow import Workflow
 
-    experiments = [x.strip() for x in args.experiments.split(",") if x.strip()] or DEFAULT_EXPERIMENTS
+    experiments = [x.strip() for x in args.experiments.split(",") if x.strip()]
+    if args.no_plan and not experiments:
+        experiments = DEFAULT_EXPERIMENTS
     for fault_id in experiments:
         get_fault(fault_id)  # reject unknown faults before touching anything
     ctx = _ctx(settings)
     try:
-        wf = Workflow(ctx, experiments, suggest=not args.no_suggestions)
+        wf = Workflow(ctx, experiments, suggest=not args.no_suggestions, budget=args.budget,
+                      thresholds=thresholds_from(settings, args), compare_to=args.compare_to)
         run_dir = wf.run()
         print(f"\nstatus: {wf.status}   overall score: "
               f"{json.loads((run_dir / 'findings.json').read_text(encoding='utf-8')).get('overall_score')}")
@@ -265,6 +284,45 @@ def cmd_run(settings: Settings, args: Namespace) -> int:
         return 0 if wf.status == "completed" else 1
     finally:
         ctx.close()
+
+
+def cmd_plan(settings: Settings, args: Namespace) -> int:
+    """Dry run of the AI planner: discover the map, rank the catalog, print the plan. Injects nothing."""
+    from .llm import LLMClient
+    from .planner import plan
+    from .topology import discover
+
+    ctx = _ctx(settings)
+    try:
+        run_dir = ctx.new_run_dir("plan")
+        topo = discover(ctx)
+        result = plan(ctx, LLMClient(ctx.settings, ctx.log), topo, args.budget)
+        write_json(run_dir / "plan.json", result)
+        print(f"\nPlan by {result['source']}: {result['strategy']}\n")
+        for i in result["items"]:
+            print(f"  {i['rank']}. {i['fault']:<17} priority {i['priority']:<5} [{i['failure_class']}]\n"
+                  f"     why: {i['reason']}")
+        print("\nNot selected:")
+        for s in result["skipped"]:
+            print(f"  - {s['fault']:<17} priority {s['priority']:<5} {s['why']}")
+        print(f"\nsaved {run_dir / 'plan.json'}")
+        return 0
+    finally:
+        ctx.close()
+
+
+def cmd_compare(settings: Settings, args: Namespace) -> int:
+    from .compare import cmd_compare as compare
+
+    result = compare(settings, args.before, args.after)
+    print(f"overall: {result['overall_before']} -> {result['overall_after']}")
+    for r in result["rows"]:
+        print(f"  {r['fault']:<17} {r['score_before']:>5} -> {r['score_after']:<5} ({r['delta']:+.1f})  "
+              f"broken {r['broken_before']} -> {r['broken_after']}  {r['verdict']}")
+    if result["unmatched"]:
+        print(f"  not in the earlier run: {', '.join(result['unmatched'])}")
+    print(f"report updated: {settings.runs_dir / args.after / 'report.html'}")
+    return 0
 
 
 def cmd_report(settings: Settings, args: Namespace) -> int:
@@ -318,8 +376,11 @@ def cmd_list(settings: Settings, args: Namespace) -> int:
 
     print("Fault catalog (anything else is rejected):")
     for f in CATALOG.values():
-        default = "default" if f.id in DEFAULT_EXPERIMENTS else ("optional" if f.optional else "")
-        print(f"  {f.id:<16} {f.container:<25} {f.kind:<8} likelihood {f.likelihood}  {default:<8} {f.description}")
+        tag = "combo" if f.parts else ("optional" if f.optional else "")
+        print(f"  {f.id:<17} {f.container:<25} {f.kind:<8} likelihood {f.likelihood}  {tag:<8} {f.description}"
+              + (f"  [= {' + '.join(f.parts)}]" if f.parts else ""))
+    print("\nThe AI planner chooses among the non-optional faults; `run --no-plan` uses: "
+          + ", ".join(DEFAULT_EXPERIMENTS))
     print("\nSettings a fix suggestion may use (anything else is flagged; ShutterStorm never applies fixes):")
     for part, knobs in KNOBS.items():
         for name, rule in knobs.items():
