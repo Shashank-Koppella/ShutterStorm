@@ -100,7 +100,8 @@ async function strips(ctx, run, e, slot, alive) {
     const t = await ctx.api.timeline(run.id, e.label);
     if (!alive()) return;
     mount(slot, latencyStrips(t, { title: `${e.label}: latency by journey` }), stripsLegend(),
-      h("p", { class: "meta", text: `Time 0 = ${t.t0_source}. Faded dots are recovery probes after the undo. Each dot is one measured call.` }));
+      h("p", { class: "meta", text: `Time 0 = ${t.t0_source}. Faded dots are recovery probes after the undo. Each dot is one measured call.` +
+        (t.t0_source !== "injection" && t.auto_stop_after_s ? ` This run predates recorded injection times, so the automatic rollback (${t.auto_stop_after_s} s after injection) is not drawn on this axis.` : "") }));
   } catch (err) {
     mount(slot, h("p", { class: "meta", text: `Timeline not available: ${err.message}` }));
   }

@@ -40,8 +40,11 @@ export function latencyStrips(data, { title = "Latency by journey", live = false
     kids.push(s("line", { class: `marker ${cls || ""}`, x1: X(t), x2: X(t), y1: top - 10, y2: bottom + 6 }));
     kids.push(s("text", { class: "lbl", x: X(t) + (anchor === "start" ? 4 : -4), y: top - 14, "text-anchor": anchor, text: label }));
   };
-  marker(0, "Injected");
-  if (data.auto_stop_after_s) marker(data.auto_stop_after_s, `Auto-rollback ${data.auto_stop_after_s} s`, "danger", "end");
+  // Older runs have no recorded injection time: their axis starts at the first fault probe, while the
+  // auto-rollback time is measured from the injection, so that marker would land on the wrong spot.
+  const exactAxis = !data.t0_source || data.t0_source === "injection";
+  marker(0, exactAxis ? "Injected" : "First fault probe");
+  if (data.auto_stop_after_s && exactAxis) marker(data.auto_stop_after_s, `Auto-rollback ${data.auto_stop_after_s} s`, "danger", "end");
   if (data.undo_t !== null && data.undo_t !== undefined && !data.auto_stop_after_s) marker(data.undo_t, data.undo_exact === false ? "Last fault probe" : "Undone", "", "end");
 
   JOURNEY_IDS.forEach((j, i) => {

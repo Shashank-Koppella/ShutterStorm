@@ -75,6 +75,12 @@ flowchart LR
 
 The same code also runs without containers (`python -m shutterstorm ...`); then the agents run in-process.
 
+## Dashboard
+`dashboard.py` (standard library) serves the Stormglass web app (`shutterstorm/web/`, seven screens) and a
+read-only JSON API (`webapi.py`: validated, mode-separated run views). Live screens are drawn from structured
+run events (`events.py` → `runs/<id>/events.jsonl`: probe rounds, safety checks, AI decisions, rollbacks),
+never from log text. Actions reuse the CLI commands, so every safety layer applies.
+
 ## Scoring
 `S_e = 100 × (0.30·A + 0.15·L + 0.20·C + 0.15·I + 0.10·R + 0.10·B)`: availability, latency, containment,
 integrity, recovery (1 at ≤30 s → 0 at 300 s), bounded failure (fast vs hung).
