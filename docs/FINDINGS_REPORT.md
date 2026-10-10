@@ -11,6 +11,13 @@ that run. Interpretations are marked **verified** (checked in data or logs), **o
 not established) or **hypothesis**. The LLM-written text in that run's `report.html` was reviewed line by
 line; it contained several false statements (listed at the end), so it is **not** reproduced here as fact.
 
+> **Note (16:10, 10 Oct):** ShutterStorm now only *suggests* fixes and never applies them. The repair
+> results below come from earlier runs in which an older version applied and re-tested patches. Across 4
+> such re-tests of the ML failover idea (second ML instance + both URLs + faster availability checks),
+> 2 were clean and 2 still had one hung smart-search call. In the 15:34 run the AI's second patch did not
+> help at all because it added the second ML instance without listing its URL. That inconsistency is why fixes are now suggestions for
+> a human to evaluate.
+
 ## Headline
 
 **A hung dependency is handled much worse than a down one.** When a backing service is *frozen*,

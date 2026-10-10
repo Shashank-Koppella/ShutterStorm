@@ -43,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reanalyze", action="store_true",
                    help="re-run only the AI explanations on the saved evidence (no Docker/Immich access)")
     add("list", "show the fault catalog and the settings fix suggestions may use")
+    p = add("dashboard", "local web UI: inject a fault, watch it live, see the suggested fix")
+    p.add_argument("--port", type=int, default=8765)
     add("stop", "create the STOP file (the running workflow stops at the next step)")
     return parser
 

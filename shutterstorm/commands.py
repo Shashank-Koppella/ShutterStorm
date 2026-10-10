@@ -380,3 +380,10 @@ def wait_for_queues(ctx: Ctx, client, upload_start: float, limit_s: float = 1800
         ctx.log("  still processing: " + ", ".join(f"{k}={v}" for k, v in sorted(busy.items())))
         time.sleep(5)
     ctx.log(f"queues not empty after {limit_s:.0f}s; stopped waiting")
+
+
+def cmd_dashboard(settings: Settings, args: Namespace) -> int:
+    from .dashboard import serve
+
+    serve(settings, args.port)
+    return 0
