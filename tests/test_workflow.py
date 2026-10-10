@@ -59,8 +59,8 @@ def test_stop_file_aborts_and_cleans_up(ctx):
     wf = Workflow(ctx, ["ml_pause", "redis_pause"])
     original = wf.run_one
 
-    def run_one_then_stop(spec):
-        exp = original(spec)
+    def run_one_then_stop(spec, decision):
+        exp = original(spec, decision)
         ctx.journal.request_stop()
         return exp
 

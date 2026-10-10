@@ -27,7 +27,8 @@ QUEUE_SNAPSHOT_TIMEOUT_S = 3.0  # GET /queues hangs too when Postgres/Redis is f
 
 
 def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: str | None = None,
-                   window_s: float | None = None, on_round=None, thresholds: Thresholds | None = None) -> dict:
+                   window_s: float | None = None, on_round=None, thresholds: Thresholds | None = None,
+                   params: dict | None = None) -> dict:
     """Run one fault experiment and return all evidence as a dict."""
     t = ctx.settings.timings
     label = label or spec.id
@@ -38,7 +39,7 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
     check_stop(ctx)
 
     queues_before = prober.queue_snapshot()
-    actives = apply_faults(ctx, spec, ttl_s=ctx.settings.max_fault_seconds)
+    actives = apply_faults(ctx, spec, ttl_s=ctx.settings.max_fault_seconds, params=params)
     fault_results: list[ProbeResult] = []
     queue_series: list[dict] = []
     logs: dict[str, str] = {}
@@ -91,6 +92,7 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
         "service": spec.service,
         "services": list(spec.services),
         "parts": [p.id for p in spec.atomic],
+        "params": params or {},
         "window_s": window,
         "fault_duration_s": round(undo_started - applied_at, 1),
         "ttl_fired": any(a.ttl_fired for a in actives),

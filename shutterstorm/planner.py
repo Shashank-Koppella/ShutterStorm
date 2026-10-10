@@ -1,8 +1,17 @@
-"""AI experiment planner: rank and select experiments from the dependency map.
+"""AI experiment planner: the AI decides what to break, when, and how safely.
 
-The Planner agent (LLM) chooses *which* catalog faults to run and in what order, with a
-short reason for each. It can only choose from the fixed catalog (anything else fails
-validation), so the AI decides what is worth testing but never what is safe to do.
+* **What**: the Planner agent (LLM) ranks the fixed fault catalog on the dependency map and
+  writes a tentative plan with a reason per experiment (:func:`plan`).
+* **When**: before EVERY experiment it decides again (:func:`decide_next`), seeing what the
+  experiments of this run have shown so far; it may follow or change its tentative plan.
+* **How safely**: for each experiment it also picks the fault strength (CPU limit, number of
+  traffic clients, network delay or loss), the fault duration and the safety limits that
+  roll the fault back (:func:`decide_settings`).
+
+Hard rules the AI cannot break (enforced in code, not in the prompt): only catalog faults;
+strength and duration are clamped to fixed bounds; safety limits can only be made STRICTER
+than the configured caps, never looser; blast-radius checking, TTL, guard and journal always
+apply. Any invalid answer -> one retry -> the deterministic choice below.
 
 Every candidate gets deterministic features first (from the discovered dependency map,
 the scoring weights and earlier runs), and a deterministic ranking that is used whenever
@@ -26,7 +35,8 @@ import json
 from pathlib import Path
 
 from .agents import _ask, _need, grounding_errors
-from .faults import CATALOG, NETEM_ARGS, NETEM_IMAGE, FaultSpec
+from .config import Thresholds
+from .faults import CATALOG, FAULT_KNOBS, NETEM_ARGS, NETEM_IMAGE, FaultSpec
 from .llm import LLMClient
 from .probes import ALL_JOURNEYS
 from .scoring import CRITICALITY, LIKELIHOOD
@@ -40,6 +50,9 @@ MIN_CLASSES = 3
 MAX_PER_SERVICE = 2
 MAX_COMBOS = 1
 DEFAULT_BUDGET = 6
+DURATION_BOUNDS = (15.0, 45.0)        # fault window the AI may choose, seconds
+ERROR_RATE_FLOOR = 0.25               # stricter than this would stop almost every experiment at once
+P95_FLOOR_MS = 2000.0
 
 
 # ====================================================================== features
@@ -127,23 +140,32 @@ def _reason(c: dict) -> str:
 
 
 # ====================================================================== selection
+def allowed_next(c: dict, picked: list[dict], budget: int, min_classes: int) -> bool:
+    """May ``c`` be the next experiment after ``picked``, keeping every selection rule satisfiable?"""
+    if not c["available"] or any(p["fault"] == c["fault"] for p in picked) or len(picked) >= budget:
+        return False
+    if sum(p["primary_service"] == c["primary_service"] for p in picked) >= MAX_PER_SERVICE:
+        return False
+    if c["kind"] == "combo" and sum(p["kind"] == "combo" for p in picked) >= MAX_COMBOS:
+        return False
+    classes = {p["failure_class"] for p in picked}
+    missing = min_classes - len(classes)
+    # the remaining slots are reserved for failure classes not covered yet
+    return not (missing > 0 and budget - len(picked) <= missing and c["failure_class"] in classes)
+
+
+def min_classes_for(cands: list[dict], budget: int) -> int:
+    return min(MIN_CLASSES, budget, len({c["failure_class"] for c in cands if c["available"]}))
+
+
 def select(ordered: list[dict], budget: int) -> list[dict]:
     """Pick from ``ordered`` (best first): cover every service, then fill with constraints."""
     pool = [c for c in ordered if c["available"]]
-    min_classes = min(MIN_CLASSES, len({c["failure_class"] for c in pool}))
+    min_classes = min_classes_for(pool, budget)
     picked: list[dict] = []
 
     def allowed(c: dict) -> bool:
-        if c in picked or len(picked) >= budget:
-            return False
-        if sum(p["primary_service"] == c["primary_service"] for p in picked) >= MAX_PER_SERVICE:
-            return False
-        if c["kind"] == "combo" and sum(p["kind"] == "combo" for p in picked) >= MAX_COMBOS:
-            return False
-        classes = {p["failure_class"] for p in picked}
-        missing = min_classes - len(classes)
-        # the remaining slots are reserved for failure classes not covered yet
-        return not (missing > 0 and budget - len(picked) <= missing and c["failure_class"] in classes)
+        return allowed_next(c, picked, budget, min_classes)
 
     for service in dict.fromkeys(c["primary_service"] for c in pool):  # 1) coverage of the map
         best = next((c for c in pool if c["primary_service"] == service and c["kind"] != "combo" and allowed(c)), None)
@@ -183,7 +205,7 @@ def check_plan(data: dict, cands: list[dict], budget: int) -> list[str]:
     if len(seen) != min(budget, len(allowed)):
         errors.append(f"choose exactly {min(budget, len(allowed))} experiments (got {len(seen)})")
     classes = {allowed[f]["failure_class"] for f in seen}
-    need = min(MIN_CLASSES, len({c["failure_class"] for c in allowed.values()}))
+    need = min_classes_for(list(allowed.values()), budget)
     if len(classes) < need:
         errors.append(f"cover at least {need} different failure classes (got {sorted(classes)})")
     if sum(allowed[f]["kind"] == "combo" for f in seen) > MAX_COMBOS:
@@ -248,3 +270,172 @@ def plan(ctx, llm: LLMClient, topology: dict, budget: int = DEFAULT_BUDGET) -> d
 
 def spec_list(p: dict) -> list[FaultSpec]:
     return [CATALOG[i["fault"]] for i in p["items"]]
+
+
+# ====================================================================== how safely: settings
+def setting_bounds(spec: FaultSpec, caps: Thresholds, max_fault_s: float,
+                   default_window: float = 35.0) -> dict[str, tuple]:
+    """Every setting the AI may choose for ``spec``: name -> (default, low, high)."""
+    hi_dur = min(DURATION_BOUNDS[1], max_fault_s - 5)
+    default_dur = min(default_window, hi_dur)
+    bounds = {
+        "duration_s": (default_dur, min(DURATION_BOUNDS[0], default_dur), hi_dur),
+        # safety limits: the configured value is the CAP; the AI may only go stricter (lower)
+        "max_error_rate": (caps.max_error_rate, min(ERROR_RATE_FLOOR, caps.max_error_rate), caps.max_error_rate),
+        "max_p95_ms": (caps.max_p95_ms, min(P95_FLOOR_MS, caps.max_p95_ms), caps.max_p95_ms),
+    }
+    for part in spec.atomic:
+        if part.kind in FAULT_KNOBS:
+            name, default, lo, hi = FAULT_KNOBS[part.kind]
+            bounds[name] = (default, lo, hi)
+    return bounds
+
+
+def decide_settings(spec: FaultSpec, raw: dict | None, caps: Thresholds, max_fault_s: float,
+                    source: str = "default", default_window: float = 35.0) -> dict:
+    """Clamp the AI's requested settings to the hard bounds; record every adjustment."""
+    raw = raw if isinstance(raw, dict) else {}
+    chosen, notes = {}, []
+    for name, (default, lo, hi) in setting_bounds(spec, caps, max_fault_s, default_window).items():
+        value = raw.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if name in raw:
+                notes.append(f"{name}={raw[name]!r} is not a number -> default {default}")
+            value = default
+        clamped = min(hi, max(lo, float(value)))
+        if clamped != float(value):
+            notes.append(f"{name} {value} -> {clamped:g} (allowed {lo:g}..{hi:g}"
+                         + (", safety limits may only be stricter than the configured cap" if name.startswith("max_") else "")
+                         + ")")
+        chosen[name] = int(clamped) if name in ("workers", "delay_ms", "loss_pct") else round(clamped, 3)
+    ignored = sorted(set(raw) - set(chosen))
+    if ignored:
+        notes.append(f"ignored unknown settings: {', '.join(ignored)}")
+    thresholds = Thresholds(max_error_rate=chosen["max_error_rate"], max_p95_ms=chosen["max_p95_ms"],
+                            blast_radius=caps.blast_radius, rounds=caps.rounds)
+    params = {k: v for k, v in chosen.items() if k not in ("duration_s", "max_error_rate", "max_p95_ms")}
+    return {"settings": chosen, "params": params, "duration_s": chosen["duration_s"], "thresholds": thresholds,
+            "safety": thresholds.describe(), "clamped": notes, "settings_source": source}
+
+
+# ====================================================================== when: the next experiment
+def observation(exp: dict) -> dict:
+    """What one finished experiment showed, compact, for the next decision."""
+    return {
+        "fault": exp["fault"],
+        "heatmap": exp["heatmap"],
+        "score": exp["scoring"]["score"],
+        "severity": exp["scoring"]["severity"],
+        "auto_stopped": (exp.get("auto_stopped") or {}).get("reason"),
+        "recovery_s": exp.get("recovery_s"),
+        "unexpected_impact": exp.get("prediction_check", {}).get("fn", []),
+        "predicted_but_fine": exp.get("prediction_check", {}).get("fp", []),
+        "ghost_uploads": exp.get("integrity", {}).get("ghost_uploads", 0),
+        "settings_used": (exp.get("decision") or {}).get("settings"),
+    }
+
+
+def deterministic_next(cands: list[dict], plan_items: list[dict], done: list[dict], budget: int) -> dict | None:
+    """Fallback 'what next': the next tentative-plan item that is still allowed, else the best allowed
+    candidate, boosting services that were hit hard earlier in this run (dig deeper where it hurts)."""
+    picked = [c for f in done for c in cands if c["fault"] == f["fault"]]
+    min_classes = min_classes_for(cands, budget)
+    by_id = {c["fault"]: c for c in cands}
+    for item in plan_items:
+        c = by_id.get(item["fault"])
+        if c and allowed_next(c, picked, budget, min_classes):
+            return {"fault": c["fault"], "reason": item["reason"], "from_plan": True}
+    hurt = {f["fault"]: f for f in done if f["severity"] >= 0.07}
+    hurt_services = {by_id[f]["primary_service"] for f in hurt if f in by_id}
+    pool = [c for c in cands if allowed_next(c, picked, budget, min_classes)]
+    if not pool:
+        return None
+    best = max(pool, key=lambda c: c["priority"] + (0.2 if c["primary_service"] in hurt_services else 0))
+    return {"fault": best["fault"], "reason": best["deterministic_reason"], "from_plan": False}
+
+
+def check_decision(d: dict, allowed: set[str]) -> list[str]:
+    errors = _need(d, {"fault": str, "reason": str, "safety_reason": str})
+    if errors:
+        return errors
+    if d["fault"] not in allowed:
+        errors.append(f"{d['fault']!r} is not allowed next; choose one of {sorted(allowed)}")
+    if not d["reason"].strip() or not d["safety_reason"].strip():
+        errors.append("reason and safety_reason must not be empty")
+    if "settings" in d and not isinstance(d["settings"], dict):
+        errors.append("settings must be an object of numbers")
+    return errors
+
+
+def decide_next(ctx, llm: LLMClient, the_plan: dict, done_exps: list[dict], caps: Thresholds,
+                budget: int) -> dict | None:
+    """Decide the next experiment (what), now (when), and with which strength / limits (how safely)."""
+    cands = the_plan["candidates"]
+    done = [observation(e) for e in done_exps]
+    picked = [c for f in done for c in cands if c["fault"] == f["fault"]]
+    min_classes = min_classes_for(cands, budget)
+    pool = [c for c in cands if allowed_next(c, picked, budget, min_classes)]
+    if len(done) >= budget or not pool:
+        return None
+    remaining_plan = [i for i in the_plan["items"] if i["fault"] not in {f["fault"] for f in done}]
+    fallback = deterministic_next(cands, remaining_plan, done, budget)
+    bounds = {c["fault"]: {k: {"default": v[0], "min": v[1], "max": v[2]}
+                           for k, v in setting_bounds(CATALOG[c["fault"]], caps, ctx.settings.max_fault_seconds,
+                                                      ctx.settings.timings.fault_window_s).items()}
+              for c in pool}
+    payload = {
+        "step": len(done) + 1, "budget": budget,
+        "observed_so_far_in_this_run": done,
+        "tentative_plan_remaining": [{"fault": i["fault"], "reason": i["reason"]} for i in remaining_plan],
+        "allowed_next": [{k: c[k] for k in ("fault", "description", "failure_class", "services", "criticality",
+                                            "predicted_impacted", "hang_style", "priority")} for c in pool],
+        "settings_bounds": bounds,
+        "safety_rules": "max_error_rate and max_p95_ms are CAPS: you may only choose stricter (lower) values. "
+                        "Blast-radius checking, the 60 s TTL and the guard always apply.",
+        "deterministic_suggestion": fallback["fault"] if fallback else None,
+    }
+    instruction = (
+        "You are the experiment Planner of a chaos-engineering tool, deciding the NEXT experiment while the run is "
+        "in progress. Use what was observed so far in this run: dig deeper where something broke unexpectedly or "
+        "hung, avoid repeating what is already clear, keep covering failure classes. Decide (1) WHAT: one fault id "
+        "from allowed_next (you may change the tentative plan), (2) HOW HARD and HOW LONG: settings within "
+        "settings_bounds (duration_s, and the fault's strength knob if it has one), and (3) HOW SAFELY: "
+        "max_error_rate and max_p95_ms, stricter for risky targets (e.g. the database, or a service that already "
+        "hung) and never above their max. Schema: {\"fault\": str, \"reason\": str (one sentence: why this "
+        "experiment now, citing what was observed), \"settings\": {\"duration_s\": number, \"max_error_rate\": "
+        "number, \"max_p95_ms\": number, ...strength knob}, \"safety_reason\": str (one sentence: why these "
+        "limits and this strength)}")
+    allowed = {c["fault"] for c in pool}
+    data, source = _ask(llm, instruction, payload, lambda d: check_decision(d, allowed) or grounding_errors(
+        {"r": [d["reason"], d["safety_reason"]]}, ["r"], {**payload, "chosen": d.get("settings")}))
+    plan_next = remaining_plan[0]["fault"] if remaining_plan else None
+    if data is None:
+        if fallback is None:
+            return None
+        spec = CATALOG[fallback["fault"]]
+        decision = {"fault": fallback["fault"], "reason": fallback["reason"], "source": "fallback",
+                    "safety_reason": "default strength and the configured safety limits (no valid AI decision)",
+                    **decide_settings(spec, None, caps, ctx.settings.max_fault_seconds, "default",
+                                      ctx.settings.timings.fault_window_s)}
+    else:
+        spec = CATALOG[data["fault"]]
+        decision = {"fault": data["fault"], "reason": data["reason"].strip(), "source": source,
+                    "safety_reason": data["safety_reason"].strip(),
+                    **decide_settings(spec, data.get("settings"), caps, ctx.settings.max_fault_seconds, source,
+                                      ctx.settings.timings.fault_window_s)}
+    decision.update(step=len(done) + 1, followed_plan=decision["fault"] == plan_next, plan_next=plan_next)
+    return decision
+
+
+def operator_decision(spec: FaultSpec, caps: Thresholds, max_fault_s: float, step: int,
+                      window_s: float = 35.0) -> dict:
+    """Settings for an experiment the operator chose (no AI): defaults within the same bounds."""
+    return {"fault": spec.id, "reason": "chosen by the operator", "source": "operator",
+            "safety_reason": "default strength and the configured safety limits", "step": step,
+            "followed_plan": True, "plan_next": spec.id,
+            **decide_settings(spec, None, caps, max_fault_s, "operator", window_s)}
+
+
+def decision_record(decision: dict) -> dict:
+    """JSON-safe copy of a decision (the Thresholds object becomes its description)."""
+    return {k: v for k, v in decision.items() if k != "thresholds"}

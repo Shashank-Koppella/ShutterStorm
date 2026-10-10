@@ -2,10 +2,12 @@
 
     check environment, scope, clean checkpoint
       -> discover dependency map
-      -> AI experiment planner: rank + select faults from the map (unless --experiments is given)
+      -> AI experiment planner: tentative plan from the map (unless --experiments is given)
       -> baseline tests
-      -> for each planned fault:
-           predict -> inject (journal + TTL + guard) -> observe (threshold monitor: auto-rollback)
+      -> repeat up to the budget:
+           AI decides the NEXT experiment from what this run has shown so far (what + when),
+           with its strength, duration and safety limits (how safely; clamped, stricter-only)
+           -> predict -> inject (journal + TTL + guard) -> observe (threshold monitor: auto-rollback)
            -> undo + verify
            -> recovery + integrity -> score (math) -> explain (Analyst)
            -> suggest a fix (Fix Advisor) -> check the suggestion against the allowed settings
@@ -115,8 +117,14 @@ class Workflow:
             if not all(r.ok for r in results):
                 raise AbortRun("baseline is not healthy; refusing to inject faults")
 
-            for spec in self.specs:
-                exp = self.run_one(spec)
+            step = 0
+            while True:
+                decision = self.next_decision(step)
+                if decision is None:
+                    break
+                step += 1
+                spec = get_fault(decision["fault"])
+                exp = self.run_one(spec, decision)
                 self.experiments.append(exp)
                 if self.suggest and exp["actual_impacted"]:
                     exp["suggestion"] = self.suggest_fix(spec, exp)
@@ -154,16 +162,42 @@ class Workflow:
         ctx.log(f"   plan by {who}: {self.plan.get('strategy', '')}")
         for item in self.plan["items"]:
             ctx.log(f"   {item['rank']}. {item['fault']:<17} [{item['failure_class']}] {item['reason']}")
-        ctx.log(f"   safety thresholds: {self.thresholds.describe()}")
+        ctx.log(f"   safety caps (the AI may only go stricter): {self.thresholds.describe()}")
 
-    def run_one(self, spec: FaultSpec) -> dict:
+    def next_decision(self, step: int) -> dict | None:
+        """What to run next, now, and how safely: the AI planner, or the operator's list."""
+        ctx = self.ctx
+        if self.use_planner:
+            self.step(f"AI decides experiment {step + 1} of up to {self.budget}")
+            decision = planner.decide_next(ctx, self.llm, self.plan, self.experiments, self.thresholds, self.budget)
+        elif step < len(self.specs):
+            decision = planner.operator_decision(self.specs[step], self.thresholds, ctx.settings.max_fault_seconds,
+                                                 step + 1, ctx.settings.timings.fault_window_s)
+        else:
+            decision = None
+        if decision is None:
+            return None
+        who = {"live": "AI (live)", "cache": "AI (cached)", "fallback": "deterministic fallback",
+               "operator": "operator"}[decision["source"]]
+        change = "" if decision["followed_plan"] else f" (changed plan: tentative next was {decision['plan_next']})"
+        ctx.log(f"   decision by {who}: {decision['fault']}{change} - {decision['reason']}")
+        ctx.log(f"   strength/duration: {decision['settings']}; safety: {decision['safety']} - {decision['safety_reason']}")
+        for note in decision["clamped"]:
+            ctx.log(f"   clamped by the hard bounds: {note}")
+        self.plan.setdefault("decisions", []).append(planner.decision_record(decision))
+        write_json(self.run_dir / "plan.json", self.plan)
+        return decision
+
+    def run_one(self, spec: FaultSpec, decision: dict) -> dict:
         self.step(f"Inject approved fault: {spec.id}")
         deterministic = predict_impact(spec, self.topology)
         prediction = agents.predict(self.llm, spec, self.topology, deterministic)
         self.ctx.log(f"   predicted impact ({prediction['source']}): {prediction['predicted_impacted']}")
         ev = run_experiment(self.ctx, self.prober, spec, self.run_dir, on_round=self._on_round,
-                            thresholds=self.thresholds)
+                            thresholds=decision["thresholds"], window_s=decision["duration_s"],
+                            params=decision["params"])
         exp = self.build_record(ev, spec, prediction)
+        exp["decision"] = planner.decision_record(decision)
         self.step(f"Confirm failure and capture evidence: {spec.id}")
         self.ctx.log(f"   heatmap: {exp['heatmap']}  score {exp['scoring']['score']}  "
                      f"severity {exp['scoring']['severity']} ({exp['scoring']['severity_label']})")
@@ -275,6 +309,7 @@ class Workflow:
             "suggestions_enabled": self.suggest,
             "plan": {k: v for k, v in self.plan.items() if k != "candidates"},
             "thresholds": self.thresholds.describe(),
+            "decisions": self.plan.get("decisions", []),
             "steps": self.steps,
             "baseline_summary": summarize_dicts(self.baseline),
             "topology": self.topology,

@@ -30,6 +30,27 @@ NETEM_HELPER = "shutterstorm_netem_ml"
 NETEM_ARGS = {"latency": ["delay", "3000ms"], "loss": ["loss", "30%"]}
 LOAD_WORKERS = 24
 
+# Fault strength the AI may choose per experiment: knob per fault kind, its default and hard bounds.
+# Anything outside the bounds is clamped by planner.decide_settings before it reaches Docker.
+FAULT_KNOBS = {
+    "cpu": ("cpus", 0.25, 0.1, 1.0),            # Docker CPU limit (fraction of one CPU)
+    "load": ("workers", LOAD_WORKERS, 8, 48),    # concurrent read-only clients
+    "latency": ("delay_ms", 3000, 500, 5000),    # added network delay
+    "loss": ("loss_pct", 30, 5, 50),             # dropped packets
+}
+
+
+def knob(params: dict | None, kind: str):
+    """The value of ``kind``'s knob in ``params``, or its default."""
+    name, default, _, _ = FAULT_KNOBS[kind]
+    return (params or {}).get(name, default)
+
+
+def netem_args(kind: str, params: dict | None) -> list[str]:
+    if kind == "latency":
+        return ["delay", f"{int(knob(params, kind))}ms"]
+    return ["loss", f"{int(knob(params, kind))}%"]
+
 SERVICE_OF = {SERVER: "server", ML: "ml", REDIS: "redis", POSTGRES: "database"}
 COMPOSE_SERVICE_OF = {SERVER: "immich-server", ML: "immich-machine-learning", REDIS: "redis", POSTGRES: "database"}
 
@@ -122,7 +143,7 @@ def build_recipe(ctx, spec: FaultSpec) -> dict:
     raise FaultError(f"no recipe for kind {spec.kind}")
 
 
-def apply_fault_action(ctx, spec: FaultSpec, recipe: dict) -> threading.Thread | None:
+def apply_fault_action(ctx, spec: FaultSpec, recipe: dict, params: dict | None = None) -> threading.Thread | None:
     """Perform the fault. ``restart`` runs in a background thread so probes can watch it."""
     d = ctx.docker
     c = spec.container
@@ -135,16 +156,16 @@ def apply_fault_action(ctx, spec: FaultSpec, recipe: dict) -> threading.Thread |
         thread.start()
         return thread
     elif spec.kind == "cpu":
-        d.set_nano_cpus(c, 250_000_000)
+        d.set_nano_cpus(c, int(float(knob(params, "cpu")) * 1e9))
     elif spec.kind in NETEM_ARGS:
         if not d.image_present(NETEM_IMAGE):
             raise FaultError(f"{spec.id} needs the {NETEM_IMAGE} image: run `docker pull {NETEM_IMAGE}` first")
         d.run_helper(NETEM_HELPER, NETEM_IMAGE, c, ["sleep", "600"])
-        d.exec(NETEM_HELPER, ["tc", "qdisc", "add", "dev", "eth0", "root", "netem", *NETEM_ARGS[spec.kind]])
+        d.exec(NETEM_HELPER, ["tc", "qdisc", "add", "dev", "eth0", "root", "netem", *netem_args(spec.kind, params)])
     elif spec.kind == "load":
         from .load import start_load  # local import avoids a cycle
 
-        start_load(ctx, recipe["load_id"], LOAD_WORKERS)
+        start_load(ctx, recipe["load_id"], int(knob(params, "load")))
     elif spec.kind == "combo":
         raise FaultError("combo faults are applied part by part with apply_faults()")
     return None
@@ -281,7 +302,7 @@ class ActiveFault:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
-def apply_fault(ctx, spec: FaultSpec, ttl_s: float | None = None) -> ActiveFault:
+def apply_fault(ctx, spec: FaultSpec, ttl_s: float | None = None, params: dict | None = None) -> ActiveFault:
     """Journal, start the guard and TTL watchdog, then apply the fault."""
     from .guard import spawn_guard  # local import avoids a cycle
 
@@ -294,9 +315,10 @@ def apply_fault(ctx, spec: FaultSpec, ttl_s: float | None = None) -> ActiveFault
     active._timer = threading.Timer(ttl, _ttl_expired, args=(ctx, active))
     active._timer.daemon = True
     active._timer.start()
-    ctx.log(f"APPLY {spec.id}: {spec.description} (TTL {ttl:.0f}s, journal entry {entry_id})")
+    strength = f", {FAULT_KNOBS[spec.kind][0]}={knob(params, spec.kind)}" if spec.kind in FAULT_KNOBS else ""
+    ctx.log(f"APPLY {spec.id}: {spec.description} (TTL {ttl:.0f}s{strength}, journal entry {entry_id})")
     try:
-        active.thread = apply_fault_action(ctx, spec, recipe)
+        active.thread = apply_fault_action(ctx, spec, recipe, params)
     except Exception:
         ctx.log(f"apply of {spec.id} failed; undoing immediately")
         undo_fault(ctx, active)
@@ -304,12 +326,12 @@ def apply_fault(ctx, spec: FaultSpec, ttl_s: float | None = None) -> ActiveFault
     return active
 
 
-def apply_faults(ctx, spec: FaultSpec, ttl_s: float | None = None) -> list[ActiveFault]:
+def apply_faults(ctx, spec: FaultSpec, ttl_s: float | None = None, params: dict | None = None) -> list[ActiveFault]:
     """Apply a fault, or every part of a combo. If a part fails, the parts already applied are undone."""
     applied: list[ActiveFault] = []
     try:
         for part in spec.atomic:
-            applied.append(apply_fault(ctx, part, ttl_s=ttl_s))
+            applied.append(apply_fault(ctx, part, ttl_s=ttl_s, params=params))
     except Exception:
         undo_faults(ctx, applied)
         raise

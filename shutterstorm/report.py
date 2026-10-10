@@ -69,7 +69,18 @@ def render_markdown(data: dict) -> str:
                        f"{i['reason']} |")
         if plan.get("skipped"):
             out.append("\nNot selected: " + "; ".join(f"{x['fault']} ({x['why']})" for x in plan["skipped"]))
-    out.append(f"\n**Safety thresholds** (automatic rollback): {data.get('thresholds', 'n/a')}  ")
+    decisions = data.get("decisions") or []
+    if decisions:
+        out.append("\n## AI decisions: what, when, how safely\n")
+        out.append("| Step | Experiment | Decided by | Plan | Strength and duration | Safety limits | Why | Why these limits |"
+                   "\n|---|---|---|---|---|---|---|---|")
+        for d in decisions:
+            plan_note = "as planned" if d.get("followed_plan") else f"changed plan (was {d.get('plan_next')})"
+            strength = ", ".join(f"{k}={v}" for k, v in d["settings"].items() if not k.startswith("max_"))
+            out.append(f"| {d['step']} | {d['fault']} | {d['source']} | {plan_note} | {strength} | {d['safety']} | "
+                       f"{d['reason']} | {d['safety_reason']}"
+                       + (f" (clamped: {'; '.join(d['clamped'])})" if d.get("clamped") else "") + " |")
+    out.append(f"\n**Safety caps** (automatic rollback; the AI may only choose stricter): {data.get('thresholds', 'n/a')}  ")
     stopped = [e for e in data["experiments"] if e.get("auto_stopped")]
     out.append(f"Auto-stopped experiments: {len(stopped)} of {len(data['experiments'])}"
                + "".join(f"\n- **{e['label']}** AUTO-STOPPED after {e['auto_stopped']['after_s']}s: "
@@ -214,7 +225,7 @@ Fixes are suggestions only: ShutterStorm never applies them.</p></div></div>"""]
 
     plan = data.get("plan") or {}
     if plan.get("items"):
-        parts.append(f"<h2>Experiment plan</h2><div class='card scroll'><p><b>Chosen by:</b> {_e(plan.get('source'))}"
+        parts.append(f"<h2>Experiment plan (tentative)</h2><div class='card scroll'><p><b>Chosen by:</b> {_e(plan.get('source'))}"
                      f"{badge(plan.get('source')) if plan.get('source') in ('live', 'cache', 'fallback') else ''}"
                      f"<br><span class='muted'>{_e(plan.get('strategy'))}</span></p><table><tr><th>#</th>"
                      "<th>Experiment</th><th>Failure class</th><th>Priority</th><th>Why (planner)</th></tr>"
@@ -227,9 +238,30 @@ Fixes are suggestions only: ShutterStorm never applies them.</p></div></div>"""]
                                    for x in plan["skipped"]) + "</ul></details>")
         parts.append("<p class='muted'>The planner may only choose faults from the fixed catalog; injection, "
                      "undo and safety limits are deterministic code.</p></div>")
+    decisions = data.get("decisions") or []
+    if decisions:
+        def plan_note(d):
+            return "as planned" if d.get("followed_plan") else f"changed plan (tentative next: {d.get('plan_next')})"
+
+        def strength(d):
+            return ", ".join(f"{k} = {v}" for k, v in d["settings"].items() if not k.startswith("max_"))
+        parts.append("<h2>AI decisions: what, when, how safely</h2><div class='card scroll'><p class='muted'>Before every "
+                     "experiment the planner decides what to break next from what this run has shown so far, how hard "
+                     "and how long, and the limits that roll it back. Code clamps every value to hard bounds; safety "
+                     "limits can only be made stricter than the configured caps.</p><table><tr><th>Step</th>"
+                     "<th>Experiment</th><th>Decided by</th><th>Plan</th><th>Strength and duration</th><th>Safety limits</th>"
+                     "<th>Why now</th><th>Why these limits</th></tr>"
+                     + "".join(f"<tr><td>{_e(d['step'])}</td><td><b>{_e(d['fault'])}</b></td>"
+                               f"<td>{badge(d['source']) if d['source'] in ('live', 'cache', 'fallback') else _e(d['source'])}</td>"
+                               f"<td>{_e(plan_note(d))}</td><td>{_e(strength(d))}</td><td>{_e(d['safety'])}</td>"
+                               f"<td>{_e(d['reason'])}</td><td>{_e(d['safety_reason'])}"
+                               + (f"<br><span class='muted'>clamped: {_e('; '.join(d['clamped']))}</span>" if d.get("clamped") else "")
+                               + "</td></tr>" for d in decisions)
+                     + "</table></div>")
+
     stopped = [e for e in data["experiments"] if e.get("auto_stopped")]
-    parts.append(f"<h2>Safety controls</h2><div class='card'><p><b>Automatic rollback</b> when "
-                 f"{_e(data.get('thresholds', 'n/a'))}. Plus: write-ahead journal, {_e('TTL watchdog')}, dead-man guard "
+    parts.append(f"<h2>Safety controls</h2><div class='card'><p><b>Automatic rollback</b> caps (the AI may only "
+                 f"choose stricter limits per experiment): {_e(data.get('thresholds', 'n/a'))}. Plus: write-ahead journal, {_e('TTL watchdog')}, dead-man guard "
                  f"process, STOP / panic kill switches.</p><p>Auto-stopped: <b>{len(stopped)}</b> of "
                  f"{len(data['experiments'])} experiments</p>"
                  + "".join(f"<p><span class='stopped'>AUTO-STOPPED</span> <b>{_e(e['label'])}</b> after "
