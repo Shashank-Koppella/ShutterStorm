@@ -1,0 +1,7 @@
+shutterstorm.env
+.shutterstorm/
+runs/
+datasets/
+__pycache__/
+*.pyc
+.pytest_cache/
