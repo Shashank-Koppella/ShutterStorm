@@ -101,6 +101,11 @@ class Journal:
                 fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.close(fd)
                 break
+            except PermissionError:
+                # Windows: the lock file is still being deleted by another thread. Busy; retry.
+                if time.monotonic() > deadline:
+                    raise TimeoutError("journal lock is busy")
+                time.sleep(0.05)
             except FileExistsError:
                 # A lock older than 15 s belongs to a crashed process: break it.
                 try:
