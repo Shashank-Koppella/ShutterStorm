@@ -37,6 +37,7 @@ from .fixes import describe_patch, manual_steps, ml_image, normalize_patch, vali
 from .agentclient import Agents
 from .probes import ALL_JOURNEYS, AssetTracker, Prober, ProbeResult, summarize
 from .report import MANUAL_FINDINGS, render_reports
+from .events import round_results
 from .reporting_io import append_probes_csv, summary_table
 from .safety import AbortRun, check_stop, panic
 from .scoring import classify_cell, overall_score, score_experiment
@@ -78,6 +79,7 @@ class Workflow:
         check_stop(self.ctx)
         self.steps.append({"step": name, "t": time.time()})
         self.ctx.log(f"== {name}")
+        self.ctx.event("step", name=name)
 
     def _on_round(self, phase: str, n: int, results) -> None:
         self.ctx.log(f"   {phase:<8} #{n}: " + " ".join(f"{r.journey}={r.outcome}" for r in results))
@@ -87,6 +89,10 @@ class Workflow:
         ctx = self.ctx
         self.run_dir = ctx.new_run_dir("run")
         self.agents.run_id = self.run_dir.name
+        ctx.event("run_started", run_id=self.run_dir.name, kind="run", simulated=ctx.simulate,
+                  budget=self.budget if self.use_planner else len(self.specs), planner=self.use_planner,
+                  caps={"max_error_rate": self.thresholds.max_error_rate, "max_p95_ms": self.thresholds.max_p95_ms},
+                  agents=self.agents.where)
         self.started = time.time()
         ctx.journal.clear_stop()
         try:
@@ -112,6 +118,7 @@ class Workflow:
             for i in range(ctx.settings.timings.baseline_rounds):
                 r = self.prober.run_round("baseline", async_deadline=ctx.settings.timings.async_deadline_s)
                 self._on_round("baseline", i + 1, r)
+                ctx.event("baseline_round", round=i + 1, results=round_results(r))
                 results += r
             append_probes_csv(self.run_dir / "probes.csv", results)
             self.baseline = [r.to_dict() for r in results]
@@ -159,6 +166,8 @@ class Workflow:
                 {"rank": n, "fault": s.id, "reason": "chosen by the operator", "failure_class": planner.FAILURE_CLASS[s.kind]}
                 for n, s in enumerate(self.specs, 1)], "skipped": []}
         write_json(self.run_dir / "plan.json", self.plan)
+        ctx.event("plan", source=self.plan["source"], strategy=self.plan.get("strategy", ""),
+                  items=[{k: i.get(k) for k in ("rank", "fault", "failure_class", "reason")} for i in self.plan["items"]])
         who = {"live": "AI planner (live)", "cache": "AI planner (cached)", "fallback": "deterministic planner",
                "operator": "operator"}[self.plan["source"]]
         ctx.log(f"   plan by {who}: {self.plan.get('strategy', '')}")
@@ -189,6 +198,7 @@ class Workflow:
         for note in decision["clamped"]:
             ctx.log(f"   clamped by the hard bounds: {note}")
         self.plan.setdefault("decisions", []).append(planner.decision_record(decision))
+        ctx.event("decision", **planner.decision_record(decision))
         write_json(self.run_dir / "plan.json", self.plan)
         return decision
 
@@ -197,6 +207,10 @@ class Workflow:
         deterministic = predict_impact(spec, self.topology)
         prediction = self.agents.predict(spec, self.topology, deterministic)
         self.ctx.log(f"   predicted impact ({prediction['source']}): {prediction['predicted_impacted']}")
+        self.ctx.event("experiment_started", fault=spec.id, parts=[p.id for p in spec.atomic], params=decision["params"],
+                       duration_s=decision["duration_s"], predicted=prediction["predicted_impacted"],
+                       limits={"max_error_rate": decision["thresholds"].max_error_rate,
+                               "max_p95_ms": decision["thresholds"].max_p95_ms})
         ev = run_experiment(self.ctx, self.prober, spec, self.run_dir, on_round=self._on_round,
                             thresholds=decision["thresholds"], window_s=decision["duration_s"],
                             params=decision["params"])
@@ -205,6 +219,9 @@ class Workflow:
         self.step(f"Confirm failure and capture evidence: {spec.id}")
         self.ctx.log(f"   heatmap: {exp['heatmap']}  score {exp['scoring']['score']}  "
                      f"severity {exp['scoring']['severity']} ({exp['scoring']['severity_label']})")
+        self.ctx.event("experiment_done", fault=spec.id, score=exp["scoring"]["score"],
+                       severity=exp["scoring"]["severity"], severity_label=exp["scoring"]["severity_label"],
+                       heatmap=exp["heatmap"], auto_stopped=exp.get("auto_stopped"), recovery_s=exp.get("recovery_s"))
         exp["analysis"] = self.agents.analyze(exp, self.topology)
         self.ctx.log(f"   analysis ({exp['analysis']['source']}): {exp['analysis']['summary'][:200]}")
         return exp
@@ -289,6 +306,8 @@ class Workflow:
             if not c["ok"]:
                 ctx.log(f"   cleanup FAILED: {c['name']} ({c['detail']})")
         ctx.log(f"   cleanup verification: {'PASS' if cleanup['ok'] else 'FAIL'}")
+        ctx.event("cleanup", ok=cleanup["ok"], checks=len(cleanup.get("checks", [])),
+                  failed=[c["name"] for c in cleanup.get("checks", []) if not c["ok"]], note=cleanup.get("note", ""))
         if self.status == "completed" and not cleanup["ok"]:
             self.status = "completed (cleanup failed)"
         self.cleanup = cleanup
@@ -296,6 +315,8 @@ class Workflow:
             self._save_findings(final=True)
             render_reports(self.run_dir)
             ctx.log(f"report: {self.run_dir / 'report.html'}")
+            ctx.event("run_finished", status=self.status, error=self.error,
+                      overall_score=overall_score(self.experiments))
         except Exception as exc:  # noqa: BLE001
             ctx.log(f"report generation failed: {exc}")
             (self.run_dir / "report_error.txt").write_text(traceback.format_exc(), encoding="utf-8")

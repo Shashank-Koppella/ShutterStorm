@@ -101,11 +101,11 @@ python -m shutterstorm seed --dir <folder of photos> --wait   # optional test co
 ```powershell
 python -m shutterstorm plan                 # dry run: what the AI planner would test and why (injects nothing)
 python -m shutterstorm run                  # full AI-planned series (6 experiments, ~7 min) -> runs/<id>/report.html
-python -m shutterstorm dashboard            # web UI at http://127.0.0.1:8765 ("Run AI plan", "Inject fault", Stop, Panic)
+python -m shutterstorm dashboard            # web UI at http://127.0.0.1:8765 (see "Dashboard" below)
 ```
 
 No Docker? Every command accepts `--simulate` (fake Docker + fake Immich, all output marked SIMULATED):
-`python -m shutterstorm --simulate run` and `python -m pytest -q` (76 tests, also in CI).
+`python -m shutterstorm --simulate run` and `python -m pytest -q` (81 tests, also in CI).
 
 ### 4. Or run ShutterStorm itself in containers (AI agents isolated)
 
@@ -140,7 +140,7 @@ controller for container runs.
 | `run --experiments a,b` / `--no-plan` | operator-chosen faults / the fixed default list instead of the planner |
 | `run --compare-to RUN` / `compare --before A --after B` | before/after table (after a human applied a fix) |
 | `run ... --max-error-rate X --max-p95-ms Y --breach-rounds N --no-blast-radius` | change the safety caps (the AI may only go stricter) |
-| `dashboard [--port 8765] [--host]` | web UI: live containers, AI plan and per-step AI decisions, inject, strict-limit auto-rollback demo, heatmap, fixes, before/after |
+| `dashboard [--port 8765] [--host]` | the Stormglass web UI: results, live run (+ replay), plan, AI decisions, safety record, dependency graph, history |
 | `seed --dir P [--wait]` | upload a folder of images; `--wait` also times thumbnail/ML processing |
 | `panic` / `stop` | kill switch: undo everything now / stop a running workflow at its next step |
 | `drill` | guard drill: inject ml_pause, hard-kill the owning process, watch the guard restore |
@@ -152,6 +152,28 @@ controller for container runs.
 Each run writes `runs/<timestamp>-run/`: `checkpoint/`, `topology.json`, `plan.json`, `probes.csv`,
 `evidence/<fault>/` (probe results, safety-monitor rounds, log tails, queue snapshots, load stats),
 `findings.json`, `cleanup.json`, `report.md`, `report.html`, `topology.md`, `run.log`.
+
+## Dashboard
+
+`python -m shutterstorm dashboard` (or the controller container on :8766) serves a local web UI built on
+the [Stormglass reference](docs/design/STORMGLASS.md): plain HTML/CSS/JavaScript modules served by the same
+standard-library server, no build step, no CDN, works offline and in the containers. Light and dark.
+
+| Screen | Its one job |
+|---|---|
+| **Run results** | outcome strip, fault × journey matrix ranked by severity, the selected finding as measured effect → safety response → proposed remediation ("Not applied · Not tested"), per-journey latency strips, score breakdown, AI analysis labelled unverified |
+| **Live run** | follows a running job from structured events: journey tiles, latency strips, error-rate and p95 meters against the AI's limits, the AI decision card, event log; when idle, **replays** a recorded run at 8× |
+| **Experiment plan** | generate a dry plan → inspect the AI's reasons and every fault's priority → start a run with the scope and rollback settings beside the button; manual injection as a secondary section |
+| **AI decisions** | each decision (what, plan changes, strength, duration, limits AI vs cap, clamps, outcome), plan vs what ran, where AI text came from, predicted vs measured impact |
+| **Safety record** | live state (containers, undo journal, guard heartbeat, STOP file), limits per experiment, breach → rollback → recovery for each auto-stop, the cleanup checks (or "Not available") |
+| **Dependency graph** | the run's saved topology: Browser → server → Postgres / Redis / ML, the undeclared ML dependency dashed, Compose / runtime-config / empirical evidence and predicted vs observed journeys |
+| **History** | score over time, every run, before/after comparisons (never invented) |
+
+Screenshots: [docs/design/screens/](docs/design/screens/). Live views draw only structured run events
+(`runs/<id>/events.jsonl`), never parsed log text. Stop and Panic stay in the top bar; Panic asks for
+confirmation and reports "Rollback requested" until the journal is empty. The server only answers requests
+for `localhost`, POST actions need the `X-ShutterStorm` header and a JSON body (so another website cannot
+trigger them), and the app is served with a strict Content-Security-Policy; run data is always rendered as text.
 
 ## Configuration (`shutterstorm.env`, gitignored; environment variables override it)
 
@@ -207,7 +229,7 @@ Each run writes `runs/<timestamp>-run/`: `checkpoint/`, `topology.json`, `plan.j
 
 | Stretch goal | Status |
 |---|---|
-| Live dashboard / simple UI | `dashboard`: live containers, AI plan, live log, heatmap, auto-stops, fixes, before/after |
+| Live dashboard / simple UI | `dashboard`: seven screens with live journey tiles, latency strips, safety meters, matrix, graphs, replay (see "Dashboard") |
 | Combined failures | `spike_ml_down`, `spike_redis_hung`; the planner may pick one per run |
 | Re-run after applying a fix | `run --experiments <faults> --compare-to <run>`: a human applies the suggested fix, ShutterStorm re-runs and reports the score / heatmap delta per fault |
 

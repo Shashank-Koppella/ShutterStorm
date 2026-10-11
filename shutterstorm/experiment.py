@@ -14,6 +14,7 @@ from pathlib import Path
 import requests
 
 from .config import SERVER, Thresholds, redact
+from .events import round_results
 from .context import write_json
 from .faults import FaultSpec, apply_faults, undo_faults
 from .load import load_stats
@@ -40,6 +41,10 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
 
     queues_before = prober.queue_snapshot()
     actives = apply_faults(ctx, spec, ttl_s=ctx.settings.max_fault_seconds, params=params)
+    limits = thresholds or ctx.settings.thresholds
+    ctx.event("injected", fault=label, parts=[p.id for p in spec.atomic], params=params or {}, window_s=window,
+              limits={"max_error_rate": limits.max_error_rate, "max_p95_ms": limits.max_p95_ms},
+              applied_at=round(time.time(), 3))
     fault_results: list[ProbeResult] = []
     queue_series: list[dict] = []
     logs: dict[str, str] = {}
@@ -58,13 +63,22 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
             fault_results += results
             if on_round:
                 on_round("fault", round_no, results)
+            ctx.event("probe_round", fault=label, phase="fault", round=round_no,
+                      t_rel=round(time.time() - applied_at, 2), results=round_results(results))
             breach = monitor.check(results)  # before the queue snapshot, which can itself hang
+            if monitor.history:
+                h = monitor.history[-1]
+                ctx.event("safety_check", fault=label, round=round_no, error_rate=h["error_rate"], p95_ms=h["p95_ms"],
+                          outside_blast_radius=h["outside_blast_radius"], breached=h["breached"],
+                          limits={"max_error_rate": limits.max_error_rate, "max_p95_ms": limits.max_p95_ms},
+                          can_roll_back=monitor.can_roll_back)
             queue_series.append({"t": round(time.time() - start, 1),
                                  "queues": prober.queue_snapshot(timeout=QUEUE_SNAPSHOT_TIMEOUT_S)})
             if breach:
                 auto_stop = {"reason": breach, "round": round_no, "after_s": round(time.time() - applied_at, 1)}
                 ctx.log(f"SAFETY THRESHOLD BREACHED for {spec.id}: {breach}. Rolling back now "
                         f"({auto_stop['after_s']}s after injection, window was {window:.0f}s)")
+                ctx.event("rollback", fault=label, reason=breach, after_s=auto_stop["after_s"], window_s=window)
                 break
             time.sleep(max(0.0, t.round_interval_s - (time.time() - round_start)))
         for name in dict.fromkeys(p.container for p in spec.atomic) | {SERVER: None}:
@@ -78,10 +92,12 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
         for a in actives:
             if a.recipe["type"] == "stop_load":
                 load = load_stats(a.recipe["load_id"]) or load
+    ctx.event("undone", fault=label, ok=undo_ok, detail=undo_detail, t_rel=round(undo_started - applied_at, 2))
     if not undo_ok:
         raise AbortRun(f"undo of {spec.id} could not be verified: {undo_detail}")
 
-    recovery_results, recovery_s = wait_for_recovery(ctx, prober, undo_started, on_round)
+    recovery_results, recovery_s = wait_for_recovery(ctx, prober, undo_started, on_round, label, applied_at)
+    ctx.event("recovered", fault=label, recovery_s=recovery_s)
     integrity = check_integrity(ctx, prober, label)
     queues_after = prober.queue_snapshot()
 
@@ -95,6 +111,8 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
         "params": params or {},
         "window_s": window,
         "fault_duration_s": round(undo_started - applied_at, 1),
+        "applied_at": round(applied_at, 3),
+        "undone_at": round(undo_started, 3),
         "ttl_fired": any(a.ttl_fired for a in actives),
         "auto_stopped": auto_stop,
         "safety": {"thresholds": (thresholds or ctx.settings.thresholds).describe(),
@@ -118,7 +136,8 @@ def run_experiment(ctx, prober: Prober, spec: FaultSpec, run_dir: Path, label: s
     return evidence
 
 
-def wait_for_recovery(ctx, prober: Prober, undo_started: float, on_round=None) -> tuple[list[ProbeResult], float | None]:
+def wait_for_recovery(ctx, prober: Prober, undo_started: float, on_round=None, label: str = "",
+                      applied_at: float | None = None) -> tuple[list[ProbeResult], float | None]:
     """Probe until every journey passes again. Applies the abort rule on liveness."""
     t = ctx.settings.timings
     results: list[ProbeResult] = []
@@ -130,6 +149,8 @@ def wait_for_recovery(ctx, prober: Prober, undo_started: float, on_round=None) -
         results += r
         if on_round:
             on_round("recovery", round_no, r)
+        ctx.event("probe_round", fault=label, phase="recovery", round=round_no,
+                  t_rel=round(time.time() - (applied_at or undo_started), 2), results=round_results(r))
         if all(x.ok for x in r):
             return results, round(time.time() - undo_started, 1)
         j0 = next(x for x in r if x.journey == "J0")

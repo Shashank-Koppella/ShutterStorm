@@ -24,6 +24,19 @@ HEARTBEAT_EVERY_S = 2.0
 _heartbeats: dict[str, threading.Thread] = {}
 
 
+def replace_atomic(tmp: Path, target: Path, attempts: int = 20) -> None:
+    """``os.replace`` that survives Windows' transient "Access is denied" while another reader
+    (or an antivirus scan of the fresh file) briefly holds the target open."""
+    for i in range(attempts):
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.02 * (i + 1))
+
+
 def owner_id() -> str:
     """This process, as other containers can name it: ``<hostname>-<pid>``."""
     return f"{socket.gethostname()}-{os.getpid()}"
@@ -50,7 +63,7 @@ def start_heartbeat(state_dir: Path) -> None:
             try:
                 tmp = path.with_suffix(".tmp")
                 tmp.write_text(json.dumps({"t": time.time(), "owner": owner}), encoding="utf-8")
-                os.replace(tmp, path)
+                replace_atomic(tmp, path)
             except OSError:
                 pass
             time.sleep(HEARTBEAT_EVERY_S)
@@ -117,7 +130,7 @@ class Journal:
     def _write(self, entries: list[dict]) -> None:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"entries": entries}, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        replace_atomic(tmp, self.path)
 
     # ---------------------------------------------------------------- API
     def add(self, kind: str, label: str, recipe: dict, ttl_s: float | None = None) -> str:

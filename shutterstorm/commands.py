@@ -143,6 +143,7 @@ def cmd_inject(settings: Settings, args: Namespace) -> int:
                 ctx.log(f"not clean: {p}")
             return 2
         run_dir = ctx.new_run_dir(f"inject-{spec.id}")
+        ctx.event("run_started", run_id=run_dir.name, kind="inject", simulated=ctx.simulate, budget=1, planner=False)
         checkpoint = take_checkpoint(ctx, run_dir)
         prober = make_prober(ctx, run_dir.name)
         prober.warmup()
