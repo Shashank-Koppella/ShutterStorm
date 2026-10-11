@@ -18,12 +18,27 @@ Immich; their only way out is an egress proxy to the Mistral API.
 > stored as "ghost uploads"); a restarted server or a stopped ML service fails fast. CPU starvation hurt
 > far less than a freeze. See [docs/FINDINGS_REPORT.md](docs/FINDINGS_REPORT.md).
 
+**Demo video:** [ShutterStorm-demo.mp4](https://github.com/Shashank-Koppella/ShutterStorm/releases/download/demo-video/ShutterStorm-demo.mp4)
+(attached to the [demo-video release](https://github.com/Shashank-Koppella/ShutterStorm/releases/tag/demo-video)).
+
+## Team
+
+Team 31 · MIT Bengaluru · graduating batch 2027
+
+| Member | Workstream | Main areas of the code |
+|---|---|---|
+| Kaustubh Aggarwal | AI Planner & Agent Layer | the Planner (what / when / how safely), Analyst, Fix Advisor and Reporter agents; schema and grounding checks; Mistral client; agents service (`planner.py`, `agents.py`, `agentclient.py`, `llm.py`, `agents_service.py`) |
+| Shashank Varma Koppella | Chaos Engine & Safety Systems | fault types and the composed catalog, undo recipes, scope check, write-ahead journal, TTL, dead-man guard, panic, cleanup verification (`faults.py`, `load.py`, `dockerctl.py`, `journal.py`, `guard.py`, `safety.py`, `checkpoint.py`) |
+| Parit Singla | Measurement, Probes & Scoring | the seven user journeys, recovery and integrity checks, dependency discovery, resilience score and severity, before/after comparison (`probes.py`, `experiment.py`, `topology.py`, `scoring.py`, `compare.py`) |
+| Venkata Tanav Reddy Elugoti | Dashboard & Reporting | the Stormglass dashboard (seven screens), JSON API, structured run events, reports (`web/`, `dashboard.py`, `webapi.py`, `events.py`, `report.py`) |
+| Asehcan Chib | Infrastructure, QA & Documentation | container deployment and AI isolation, egress proxy, simulation mode, tests and CI, documentation (`deploy/`, `egress_proxy.py`, `sim.py`, `tests/`, `docs/`) |
+
 ## Deliverables
 
 | Deliverable | Where |
 |---|---|
 | 1. Source code + README (setup, how to run) | this repository (MIT); setup below |
-| 2. Demo video (3 min) | shot list and narration: [docs/DEMO_VIDEO.md](docs/DEMO_VIDEO.md) |
+| 2. Demo video (3 min) | [ShutterStorm-demo.mp4](https://github.com/Shashank-Koppella/ShutterStorm/releases/download/demo-video/ShutterStorm-demo.mp4) · shot list and narration: [docs/DEMO_VIDEO.md](docs/DEMO_VIDEO.md) |
 | 3. Architecture overview (one page) | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | 4. Findings report (ranked weaknesses + fixes) | [docs/FINDINGS_REPORT.md](docs/FINDINGS_REPORT.md) |
 | Dependency graphs (generated) | [docs/DEPENDENCY_GRAPH.md](docs/DEPENDENCY_GRAPH.md) |
@@ -118,7 +133,7 @@ python -m shutterstorm dashboard            # web UI at http://127.0.0.1:8765 (s
 ```
 
 No Docker? Every command accepts `--simulate` (fake Docker + fake Immich, all output marked SIMULATED):
-`python -m shutterstorm --simulate run` and `python -m pytest -q` (81 tests, also in CI).
+`python -m shutterstorm --simulate run` and `python -m pytest -q` (112 tests, also in CI).
 
 ### 4. Or run ShutterStorm itself in containers (AI agents isolated)
 
@@ -217,7 +232,8 @@ trigger them), and the app is served with a strict Content-Security-Policy; run 
    generator only talks to `IMMICH_URL` and only sends read-only requests.
 2. **Composed, bounded catalog**: the AI composes experiments only from known fault types × sandbox targets;
    anything else is rejected by the planner's validator and again by the controller.
-   Postgres is never killed; `db_stop` and the netem faults are never picked automatically.
+   Stopping or restarting Postgres is manual-only (never picked automatically); network faults need the
+   `nicolaka/netshoot` image.
 3. **Write-ahead journal**: the undo recipe is written before a fault is applied and removed only after the
    undo is verified. Combined failures get one entry per part.
 4. **Threshold safety monitor**: after every probe round, error rate, p95 latency and blast radius are
@@ -244,7 +260,7 @@ trigger them), and the app is served with a strict Content-Security-Policy; run 
 | Stretch goal | Status |
 |---|---|
 | Live dashboard / simple UI | `dashboard`: seven screens with live journey tiles, latency strips, safety meters, matrix, graphs, replay (see "Dashboard") |
-| Combined failures | `spike_ml_down`, `spike_redis_hung`; the planner may pick one per run |
+| Combined failures | 14 `spike_<fault>` combinations (traffic spike + a fault on Postgres, Redis or ML); the planner may pick one per run |
 | Re-run after applying a fix | `run --experiments <faults> --compare-to <run>`: a human applies the suggested fix, ShutterStorm re-runs and reports the score / heatmap delta per fault |
 
 ## Troubleshooting
