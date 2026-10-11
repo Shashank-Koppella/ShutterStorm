@@ -208,10 +208,12 @@ async function render(ctx, alive) {
 }
 
 async function tick(ctx) {
-  if (!S) return;
+  // A run can start (or report its run id) after this screen was rendered, e.g. when "Start AI run"
+  // navigates here before the job's first status poll: switch to following it as soon as it is known.
   const job = ctx.state.status?.job || {};
-  if (job.running && job.kind === "run" && job.run_id && job.run_id !== S.runId) return render(ctx, () => true);
-  if (S.live) await load(ctx);
+  const liveId = job.running && job.kind === "run" ? job.run_id : null;
+  if (liveId && (!S || !S.live || S.runId !== liveId)) return render(ctx, () => true);
+  if (S?.live) await load(ctx);
 }
 
 export default { title: "Live run", icon: "activity", render, tick };
