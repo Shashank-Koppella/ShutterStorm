@@ -1,7 +1,7 @@
 // Experiment plan: generate a dry plan -> inspect -> run. Manual injection is secondary.
 import { h, icon, mount, toast } from "../js/dom.js";
 import { barList } from "../js/charts.js";
-import { SOURCE, faultTitle, pct, num, ago, plural } from "../js/format.js";
+import { SOURCE, TARGET_LABEL, faultTitle, pct, num, ago, plural } from "../js/format.js";
 import { viewHead, appState } from "../js/app.js";
 
 let waitingForPlan = false;
@@ -15,13 +15,38 @@ function planList(p) {
 
 function candidateChart(p) {
   const picked = new Set((p.items || []).map((i) => i.fault));
-  const cands = [...(p.candidates || [])].sort((a, b) => (b.priority || 0) - (a.priority || 0));
-  const max = Math.max(1, ...cands.map((c) => c.priority || 0));
-  return barList(cands.map((c) => ({
+  const all = [...(p.candidates || [])].sort((a, b) => (b.priority || 0) - (a.priority || 0));
+  const max = Math.max(1, ...all.map((c) => c.priority || 0));
+  const bars = (cands) => barList(cands.map((c) => ({
     name: c.fault, value: c.priority || 0, max, display: num(c.priority, 2),
     cls: picked.has(c.fault) ? "" : "muted",
     title: `${c.fault}: priority ${num(c.priority, 3)} (risk ${num(c.risk, 2)}, novelty ${num(c.novelty, 2)})${c.available ? "" : ` · not available: ${c.unavailable_reason}`}${picked.has(c.fault) ? " · selected" : ""}`,
-  })), { label: "Deterministic priority of every catalog fault" });
+  })), { label: "Deterministic priority of composed experiments" });
+  // Show the selected experiments and the strongest alternatives; the rest behind a disclosure.
+  const top = all.filter((c, i) => picked.has(c.fault) || i < 12);
+  const rest = all.filter((c) => !top.includes(c));
+  return h("div", bars(top),
+    rest.length ? h("details", { style: { marginTop: "8px" } }, h("summary", { class: "meta", text: `Show the other ${rest.length} compositions` }), bars(rest)) : null);
+}
+
+function compositionGrid(p) {
+  // Fault type x target: which compositions the planner had (and which it picked).
+  const cands = p.candidates || [];
+  const picked = new Set((p.items || []).map((i) => i.fault));
+  const types = [["pause", "Freeze"], ["stop", "Stop"], ["restart", "Restart"], ["cpu", "CPU limit"], ["latency", "Delay"], ["loss", "Loss"]];
+  const targets = ["server", "database", "redis", "ml"];
+  const find = (t, k, spike) => cands.find((c) => c.primary_service === t && (spike ? c.kind === "combo" : c.kind === k) &&
+    (!spike || c.fault.endsWith(k === "cpu" ? "cpu_throttle" : k === "loss" ? "packet_loss" : k)));
+  const cell = (c) => {
+    if (!c) return h("span", { class: "cell na", text: "—" });
+    const state = picked.has(c.fault) ? "Picked" : c.available ? "Option" : "Off";
+    return h("span", { class: `cell ${picked.has(c.fault) ? "slow" : c.available ? "" : "na"}`, title: `${c.fault}${c.available ? "" : `: ${c.unavailable_reason}`}`, text: state });
+  };
+  return h("div", { class: "matrix" },
+    h("div", { class: "mrow head", style: { gridTemplateColumns: "minmax(120px,1.2fr) repeat(6,minmax(0,1fr))" } },
+      h("span", { class: "meta", text: "Target / fault type" }), types.map(([, w]) => h("span", { class: "mcol", text: w }))),
+    targets.map((t) => h("div", { class: "mrow", style: { gridTemplateColumns: "minmax(120px,1.2fr) repeat(6,minmax(0,1fr))" } },
+      h("span", { text: TARGET_LABEL[t] }), types.map(([k]) => cell(find(t, k, false))))));
 }
 
 async function render(ctx, alive) {
@@ -58,9 +83,12 @@ async function render(ctx, alive) {
   } }, icon("play"), "Start AI run");
 
   const faults = cat.faults || [];
-  const faultSel = h("select", { "aria-label": "Catalog fault" },
-    h("optgroup", { label: "Planner-eligible faults" }, faults.filter((f) => !f.optional).map((f) => h("option", { value: f.id, text: `${f.id} · ${f.description}` }))),
-    h("optgroup", { label: "Optional (never planned automatically)" }, faults.filter((f) => f.optional).map((f) => h("option", { value: f.id, text: `${f.id} · ${f.description}` }))));
+  const opt = (f) => h("option", { value: f.id, text: `${f.id} · ${f.description}` });
+  const faultSel = h("select", { "aria-label": "Fault to inject" },
+    ["server", "database", "redis", "ml"].map((t) => h("optgroup", { label: `Target: ${TARGET_LABEL[t]}` },
+      faults.filter((f) => f.service === t && !f.parts.length && !f.optional).map(opt))),
+    h("optgroup", { label: "Traffic spike + another fault" }, faults.filter((f) => f.parts.length).map(opt)),
+    h("optgroup", { label: "Manual only (safety policy: never chosen by the AI)" }, faults.filter((f) => f.optional).map(opt)));
   const strictManual = h("input", { type: "checkbox", id: "strict-manual" });
   const injectBtn = h("button", { type: "button", disabled: busy, onclick: async () => {
     if (!confirm(`Inject ${faultSel.value} now?`)) return;
@@ -80,14 +108,15 @@ async function render(ctx, alive) {
     p.strategy ? h("p", { class: "ai-text", text: p.strategy }) : null,
     h("div", { class: "split" },
       h("div", h("h3", "Selected, in order"), planList(p)),
-      h("div", h("h3", "Priority of every catalog fault"), h("p", { class: "meta", text: "Deterministic features: 0.55 risk + 0.45 novelty + bonuses. Highlighted = selected by the planner." }), candidateChart(p),
+      h("div", h("h3", "What the AI could compose"), h("p", { class: "meta", text: "Fault types × the services found in the dependency map. Picked = in this plan; Off = safety policy, missing helper image, or not in the map. Traffic-spike combinations are listed in the priority bars." }), compositionGrid(p),
+        h("h3", { style: { marginTop: "16px" }, text: "Priority of each composition" }), h("p", { class: "meta", text: "Deterministic features: 0.55 risk + 0.45 novelty + bonuses. Highlighted = selected by the planner." }), candidateChart(p),
         (p.skipped || []).length ? h("details", { style: { marginTop: "12px" } }, h("summary", { class: "meta", text: `Why ${plural(p.skipped.length, "fault")} were not selected` }),
           h("ul", { class: "meta" }, p.skipped.map((s) => h("li", { text: `${s.fault}: ${s.why}` })))) : null)),
     h("div", { class: "notice" }, icon("info"), h("div", { text: "This is a preview. When a run starts, the AI re-decides before every experiment from what it has observed, so the run may differ from this list." })))
     : h("div", { class: "panel empty" }, icon("list-ordered", "icon lg"), h("h2", "No plan yet"), h("p", { text: "Generate a plan to see what the AI would test and why. Nothing is injected." }));
 
   mount(ctx.el,
-    viewHead({ title: "Experiment plan", lead: "Generate a plan, inspect the AI's reasons, then run. The AI may only choose from the fixed catalog.",
+    viewHead({ title: "Experiment plan", lead: "Generate a plan, inspect the AI's reasons, then run. The AI composes each experiment from known fault types and the services found in the dependency map.",
       right: h("div", { class: "row" }, h("label", { class: "inline" }, h("span", { class: "meta", text: "Budget" }), budget), genBtn) }),
     busy && job.kind === "plan" ? h("div", { class: "notice warn" }, icon("clock"), h("div", { text: "Planning in progress… the AI is ranking the catalog. This page updates when it finishes." })) : null,
     planPanel,
@@ -105,6 +134,7 @@ async function render(ctx, alive) {
           h("label", { class: "inline" }, strict, h("span", { text: "Strict limits demo (roll back above 10% errors)" })),
           startBtn, busy ? h("p", { class: "meta", text: `Disabled while "${job.label}" is running.` }) : null))),
     h("details", { class: "panel" }, h("summary", h("b", "Manual injection"), h("span", { class: "meta", text: "  · one catalog fault, chosen by you" })),
+      h("p", { class: "meta", text: "Same composed catalog the AI chooses from; network faults need the nicolaka/netshoot image." }),
       h("div", { class: "row", style: { marginTop: "12px" } }, faultSel, h("label", { class: "inline" }, strictManual, h("span", { text: "Strict limits" })), injectBtn)),
     job.log ? h("details", { class: "panel" }, h("summary", h("b", "Job output"), h("span", { class: "meta", text: `  · ${job.label}${job.exit !== null && job.exit !== undefined ? ` · exit ${job.exit}` : ""}` })),
       h("pre", { class: "diff", text: job.log })) : null);

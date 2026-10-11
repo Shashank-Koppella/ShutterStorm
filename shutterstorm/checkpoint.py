@@ -93,9 +93,12 @@ def verify_cleanup(ctx, checkpoint: dict, tracker=None) -> dict:
         check(f"{name} CPU limit restored", now == want, f"NanoCpus/CpuQuota {now} (expected {want})")
     helpers = ctx.docker.list_helpers()
     check("no shutterstorm_* containers", not helpers, ", ".join(helpers) or "none")
-    netem = netem_present(ctx)
-    check("no netem qdisc on ML", netem is not True,
-          {True: "netem still active", False: "none", None: "netshoot image absent, ml_latency never ran"}[netem])
+    netem = {name: netem_present(ctx, name) for name in CORE_CONTAINERS}
+    active = [n for n, v in netem.items() if v is True]
+    unchecked = all(v is None for v in netem.values())
+    check("no netem qdisc on any service", not active,
+          ", ".join(active) + " still delayed" if active else
+          ("netshoot image absent, no network fault can have run" if unchecked else "none"))
 
     try:
         current = ctx.admin(fresh=True).get_system_config()

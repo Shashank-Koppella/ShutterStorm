@@ -22,7 +22,21 @@ export const FAULT_TITLE = {
 export const SOURCE = { live: "AI · live", cache: "AI · cached", fallback: "Template", operator: "Operator", default: "Default" };
 
 export const outcomeClass = (o) => (o === "n/a" || !o ? "na" : o);
-export const faultTitle = (id) => FAULT_TITLE[id] || id;
+
+// Composed faults are "<target>_<type>" and "spike_<target>_<type>": derive a readable title.
+const TARGET_WORD = { server: "the server", db: "the database", redis: "Redis", ml: "machine learning" };
+const TYPE_TITLE = {
+  pause: (t) => `Freeze ${t}`, stop: (t) => `Stop ${t}`, restart: (t) => `Restart ${t}`,
+  cpu_throttle: (t) => `Starve ${t} of CPU`, latency: (t) => `Slow network to ${t}`, packet_loss: (t) => `Lossy network to ${t}`,
+};
+export function faultTitle(id) {
+  if (FAULT_TITLE[id]) return FAULT_TITLE[id];
+  const m = /^(spike_)?(server|db|redis|ml)_(pause|stop|restart|cpu_throttle|latency|packet_loss)$/.exec(id || "");
+  if (!m) return id;
+  const base = TYPE_TITLE[m[3]](TARGET_WORD[m[2]]);
+  return m[1] ? `Traffic spike + ${base[0].toLowerCase()}${base.slice(1)}` : base;
+}
+export const TARGET_LABEL = { server: "Immich server", database: "PostgreSQL", redis: "Redis", ml: "Machine learning" };
 
 export function num(v, digits = 1) {
   return v === null || v === undefined || Number.isNaN(v) ? "—" : Number(v).toFixed(digits);

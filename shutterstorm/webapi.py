@@ -18,7 +18,7 @@ from pathlib import Path
 
 from .config import Settings
 from .events import read_events
-from .faults import CATALOG, FAULT_KNOBS
+from .faults import ALIASES, CATALOG, FAULT_KNOBS, TARGETS, lookup
 from .planner import DURATION_BOUNDS, ERROR_RATE_FLOOR, P95_FLOOR_MS
 from .probes import JOURNEYS
 
@@ -200,7 +200,7 @@ def topology(settings: Settings, run_id: str) -> dict | None:
     findings = _load(d / "findings.json") or {}
     impacts: dict[str, list] = {}
     for e in findings.get("experiments") or []:
-        spec = CATALOG.get(e.get("fault"))
+        spec = lookup(e.get("fault"))
         if spec is None:
             continue
         impacts.setdefault(spec.service, []).append({"fault": e.get("fault"), "impacted": e.get("actual_impacted", []),
@@ -243,6 +243,7 @@ def latest_plan(settings: Settings) -> dict | None:
 def catalog(settings: Settings) -> dict:
     t = settings.thresholds
     return {
+        "targets": list(TARGETS), "aliases": ALIASES,
         "faults": [{"id": f.id, "description": f.description, "kind": f.kind, "service": f.service,
                     "optional": f.optional, "parts": list(f.parts),
                     "knob": (dict(zip(("name", "default", "min", "max"), FAULT_KNOBS[f.kind]))

@@ -69,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # AI text can contain characters a Windows console code page cannot show (e.g. "→" in cp1252):
+    # print a replacement character instead of crashing the command.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     args = build_parser().parse_args(argv)
     settings = load_settings(simulate=bool(getattr(args, "simulate", False)))
     handler = getattr(commands, f"cmd_{args.command}")

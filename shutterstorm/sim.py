@@ -11,8 +11,8 @@ The fake reproduces the manual findings:
 * M-02 ML stopped -> smart search fails fast with a 500
 * M-03 Redis paused -> upload is stored but the response never arrives; no thumbnail until unpause
 
-It also models load (many concurrent requests slow DB-bound calls down), a CPU-limited
-Postgres (slower queries) and netem delay / packet loss on the ML container.
+It also models load (many concurrent requests slow DB-bound calls down), CPU limits on any
+container (slower calls through it) and netem delay / packet loss on any container.
 
 All output from simulation mode is labelled SIMULATED. It is never a real finding.
 """
@@ -83,8 +83,7 @@ class SimWorld:
         # A container that is NOT ours: the scope check must refuse it.
         self.containers["other_team_db"] = self._container("other_team_db", project="someone-else")
         self.helpers: dict[str, dict] = {}
-        self.netem = False
-        self.netem_mode = ""  # "delay" or "loss"
+        self.netem_targets: dict[str, str] = {}  # container -> "delay" | "loss"
         self.inflight = 0
         self.inflight_lock = threading.Lock()
         self.system_config = default_system_config()
@@ -99,6 +98,18 @@ class SimWorld:
         self.server.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @property
+    def netem(self) -> bool:
+        return bool(self.netem_targets)
+
+    def slowdown(self, name: str) -> float:
+        """Extra seconds a call through ``name`` costs because of an injected netem or CPU fault."""
+        delay = {"delay": 3.0, "loss": 1.2}.get(self.netem_targets.get(name, ""), 0.0)
+        c = self.containers.get(name) or {}
+        if (c.get("nano") and c["nano"] < 1e9) or (c.get("quota") and c["quota"] < 100_000):
+            delay += 0.25
+        return delay
 
     @staticmethod
     def _container(name: str, project: str = COMPOSE_PROJECT) -> dict:
@@ -207,19 +218,20 @@ class FakeDocker:
         if cmd == "run":
             name = args[args.index("--name") + 1]
             label = args[args.index("--label") + 1].split("=")
-            w.helpers[name] = {"labels": {label[0]: label[1]}}
+            net = args[args.index("--net") + 1] if "--net" in args else ""
+            w.helpers[name] = {"labels": {label[0]: label[1]}, "target": net.removeprefix("container:")}
             return self._ok(uuid.uuid4().hex + "\n")
         if cmd == "exec":
             rest = args[2:]
+            target = w.helpers.get(args[1], {}).get("target", "")
             if rest[:2] == ["tc", "qdisc"]:
                 if rest[2] == "add":
-                    w.change(lambda: setattr(w, "netem", True))
-                    w.netem_mode = "loss" if "loss" in rest else "delay"
+                    w.change(lambda: w.netem_targets.__setitem__(target, "loss" if "loss" in rest else "delay"))
                 elif rest[2] == "del":
-                    w.change(lambda: setattr(w, "netem", False))
+                    w.change(lambda: w.netem_targets.pop(target, None))
                     return self._ok()
                 elif rest[2] == "show":
-                    return self._ok("qdisc netem 8001: root delay 3s\n" if w.netem else "qdisc noqueue 0: root\n")
+                    return self._ok("qdisc netem 8001: root delay 3s\n" if target in w.netem_targets else "qdisc noqueue 0: root\n")
             return self._ok()
         if cmd == "rm":
             w.helpers.pop(args[-1], None)
@@ -286,13 +298,11 @@ def _make_handler(w: SimWorld):
             if not c or not c["running"]:
                 self._send(500, {"message": error})
                 return False
+            delay = w.slowdown(name)
             if name == POSTGRES:
-                # Queueing in the connection pool under load, slower queries with a CPU limit.
-                delay = min(1.5, 0.03 * max(0, w.inflight - 8))
-                if (c["nano"] and c["nano"] < 1e9) or (c["quota"] and c["quota"] < 100_000):
-                    delay += 0.25
-                if delay:
-                    time.sleep(delay)
+                delay += min(1.5, 0.03 * max(0, w.inflight - 8))  # connection-pool queueing under load
+            if delay:
+                time.sleep(delay)
             return True
 
         def handle_one_request(self) -> None:
@@ -312,9 +322,14 @@ def _make_handler(w: SimWorld):
             return True
 
         def _server_up(self) -> bool:
-            if not w.containers[SERVER]["running"]:
+            srv = w.containers[SERVER]
+            if srv["paused"]:  # a frozen server: the client waits until its timeout
+                w.wait_until(lambda: not srv["paused"])
+            if not srv["running"]:
                 self._send(503, {"message": "server restarting"})
                 return False
+            if w.slowdown(SERVER):
+                time.sleep(w.slowdown(SERVER))
             return True
 
         def _asset_dto(self, a: dict) -> dict:
@@ -394,8 +409,6 @@ def _make_handler(w: SimWorld):
             chosen = ML
             if not self._gate(chosen, "Failed to search smart (Immich Server Error)"):
                 return
-            if chosen == ML and w.netem:
-                time.sleep(3.0 if w.netem_mode == "delay" else 1.2)  # loss: TCP retransmissions
             ml = w.containers[chosen]
             if (ml["nano"] and ml["nano"] < 1e9) or (ml["quota"] and ml["quota"] < 100_000):
                 time.sleep(0.8)

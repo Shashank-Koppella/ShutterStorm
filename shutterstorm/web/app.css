@@ -108,6 +108,7 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--action);
 .view-head .lead { color: var(--muted); max-width: 720px; margin: 0; }
 .runpick { display: flex; gap: 8px; align-items: center; }
 .runpick select { max-width: 320px; font-family: var(--mono); font-size: 12px; }
+.panel details .row select { max-width: 520px; font-family: var(--mono); font-size: 12px; }
 
 /* panels and layout */
 .panel { margin-top: 16px; padding: 20px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; min-width: 0; }

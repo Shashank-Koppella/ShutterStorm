@@ -1,4 +1,12 @@
-"""Fault catalog and the generic undo machinery.
+"""Fault catalog (composed from fault types x discovered targets) and the generic undo machinery.
+
+The catalog is not a hand-written list. It is generated: every FAULT TYPE (freeze, stop,
+restart, CPU limit, network delay, packet loss) applied to every TARGET service in the
+sandbox, plus a traffic spike on the entry point and "traffic spike + X" combinations. The AI
+planner composes experiments by choosing among these (fault type, target) pairs, filtered to
+the services found in the run's dependency map. Code still enforces a short safety policy:
+some pairs are manual-only (stopping / restarting Postgres), and every action passes the scope
+check. Fault ids are ``<target>_<type>`` (``redis_cpu_throttle``) and ``spike_<atomic id>``.
 
 Every fault ShutterStorm applies is described by a
 JSON *recipe* that says how to undo it, including the original values. Recipes
@@ -27,7 +35,8 @@ from .config import ML, POSTGRES, REDIS, SERVER
 from .dockerctl import DockerError
 
 NETEM_IMAGE = "nicolaka/netshoot"
-NETEM_HELPER = "shutterstorm_netem_ml"
+NETEM_PREFIX = "shutterstorm_netem_"
+NETEM_HELPER = NETEM_PREFIX + "ml"  # kept for older journal entries
 NETEM_ARGS = {"latency": ["delay", "3000ms"], "loss": ["loss", "30%"]}
 LOAD_WORKERS = 24
 
@@ -86,27 +95,59 @@ class FaultSpec:
         return tuple(CATALOG[p] for p in self.parts) if self.parts else (self,)
 
 
-CATALOG: dict[str, FaultSpec] = {f.id: f for f in [
-    FaultSpec("ml_pause", ML, "pause", "Freeze the ML container (hung dependency)", 0.5),
-    FaultSpec("ml_stop", ML, "stop", "Stop the ML container (dependency down)", 0.5),
-    FaultSpec("redis_pause", REDIS, "pause", "Freeze Redis/Valkey (job queue hung)", 0.5),
-    FaultSpec("redis_stop", REDIS, "stop", "Stop Redis/Valkey (job queue down)", 0.5),
-    FaultSpec("db_pause", POSTGRES, "pause", "Freeze Postgres (database hung)", 0.5),
-    FaultSpec("db_stop", POSTGRES, "stop", "Stop Postgres gracefully (database down)", 0.5, optional=True),
-    FaultSpec("db_cpu_throttle", POSTGRES, "cpu", "Limit Postgres CPU (overloaded database; default 0.25 CPU)", 0.6),
-    FaultSpec("server_restart", SERVER, "restart", "Restart the API server (container crash)", 0.8),
-    FaultSpec("ml_cpu_throttle", ML, "cpu", "Limit ML CPU (overloaded dependency; default 0.25 CPU)", 0.6),
-    FaultSpec("traffic_spike", SERVER, "load",
-              f"Sudden traffic spike: concurrent read-only clients (default {LOAD_WORKERS})", 0.7),
-    FaultSpec("ml_latency", ML, "latency", "Add network delay to ML (netem; default 3000 ms)", 0.6, optional=True),
-    FaultSpec("ml_packet_loss", ML, "loss", "Drop ML network packets (lossy network, netem; default 30%)", 0.6,
-              optional=True),
-    # Combined failures: several atomic faults at once, each with its own journal entry and TTL.
-    FaultSpec("spike_ml_down", ML, "combo", "Traffic spike while the ML service is down", 0.4,
-              parts=("traffic_spike", "ml_stop")),
-    FaultSpec("spike_redis_hung", REDIS, "combo", "Traffic spike while Redis is frozen", 0.4,
-              parts=("traffic_spike", "redis_pause")),
-]}
+# ============================================================== composition
+# Targets: the sandbox services a fault may hit (all of them pass the scope check in dockerctl).
+TARGETS = {"server": SERVER, "database": POSTGRES, "redis": REDIS, "ml": ML}
+TARGET_SHORT = {"server": "server", "database": "db", "redis": "redis", "ml": "ml"}
+TARGET_NAME = {"server": "the API server", "database": "Postgres", "redis": "Redis/Valkey", "ml": "the ML service"}
+# Fault types: kind -> (id suffix, description template, likelihood used by the severity formula)
+FAULT_TYPES = {
+    "pause": ("pause", "Freeze {t} (hung dependency)", 0.5),
+    "stop": ("stop", "Stop {t} (dependency down)", 0.5),
+    "restart": ("restart", "Restart {t} (container crash)", 0.8),
+    "cpu": ("cpu_throttle", "Limit {t} CPU (overloaded; default 0.25 CPU)", 0.6),
+    "latency": ("latency", "Add network delay to {t} (netem; default 3000 ms)", 0.6),
+    "loss": ("packet_loss", "Drop {t} network packets (lossy network, netem; default 30%)", 0.6),
+}
+LOAD_LIKELIHOOD, COMBO_LIKELIHOOD = 0.7, 0.4
+# Safety policy (code, not prompt): pairs the planner may never pick on its own. Postgres is never
+# stopped or restarted automatically (risk to the database); an operator can still request them.
+MANUAL_ONLY = {("database", "stop"), ("database", "restart")}
+# Kinds that make sense combined with a traffic spike (the spike targets the server itself).
+COMBINABLE = ("pause", "stop", "cpu", "latency", "loss")
+# Hand-tuned wording for the original faults (ids unchanged since the fixed catalog).
+DESCRIPTIONS = {
+    "ml_pause": "Freeze the ML container (hung dependency)",
+    "ml_stop": "Stop the ML container (dependency down)",
+    "redis_pause": "Freeze Redis/Valkey (job queue hung)",
+    "redis_stop": "Stop Redis/Valkey (job queue down)",
+    "db_pause": "Freeze Postgres (database hung)",
+    "db_stop": "Stop Postgres gracefully (database down)",
+    "server_restart": "Restart the API server (container crash)",
+}
+# Old combo ids from the fixed catalog, kept so earlier runs, docs and commands still resolve.
+ALIASES = {"spike_ml_down": "spike_ml_stop", "spike_redis_hung": "spike_redis_pause"}
+
+
+def _compose() -> dict[str, FaultSpec]:
+    out: dict[str, FaultSpec] = {}
+    for service, container in TARGETS.items():
+        for kind, (suffix, template, likelihood) in FAULT_TYPES.items():
+            fid = f"{TARGET_SHORT[service]}_{suffix}"
+            out[fid] = FaultSpec(fid, container, kind, DESCRIPTIONS.get(fid, template.format(t=TARGET_NAME[service])),
+                                 likelihood, optional=(service, kind) in MANUAL_ONLY)
+    out["traffic_spike"] = FaultSpec("traffic_spike", SERVER, "load",
+                                     f"Sudden traffic spike: concurrent read-only clients (default {LOAD_WORKERS})",
+                                     LOAD_LIKELIHOOD)
+    for fid, spec in list(out.items()):
+        if spec.kind in COMBINABLE and spec.service != "server" and not spec.optional:
+            cid = f"spike_{fid}"
+            out[cid] = FaultSpec(cid, spec.container, "combo", f"Traffic spike + {spec.description[0].lower()}{spec.description[1:]}",
+                                 COMBO_LIKELIHOOD, parts=("traffic_spike", fid))
+    return out
+
+
+CATALOG: dict[str, FaultSpec] = _compose()
 # Used with `run --no-plan` (the AI planner chooses otherwise).
 DEFAULT_EXPERIMENTS = ["ml_pause", "ml_stop", "redis_pause", "redis_stop", "db_pause", "server_restart"]
 ATOMIC_FAULTS = [f for f in CATALOG if not CATALOG[f].parts]
@@ -116,11 +157,29 @@ class FaultError(RuntimeError):
     pass
 
 
+def lookup(fault_id: str) -> FaultSpec | None:
+    """The fault with this id (or a legacy alias), else None."""
+    if not isinstance(fault_id, str):
+        return None
+    return CATALOG.get(ALIASES.get(fault_id, fault_id))
+
+
 def get_fault(fault_id: str) -> FaultSpec:
     """Look up a fault; anything not in the catalog is rejected."""
-    if fault_id not in CATALOG:
+    spec = lookup(fault_id)
+    if spec is None:
         raise FaultError(f"unknown fault {fault_id!r}. Allowed: {', '.join(CATALOG)}")
-    return CATALOG[fault_id]
+    return spec
+
+
+def netem_helper(container: str) -> str:
+    return NETEM_PREFIX + TARGET_SHORT[SERVICE_OF[container]]
+
+
+def netem_target(helper: str) -> str | None:
+    """The container a netem helper works on (from its name), else None."""
+    short = helper[len(NETEM_PREFIX):] if helper.startswith(NETEM_PREFIX) else ""
+    return next((TARGETS[s] for s, v in TARGET_SHORT.items() if v == short), None)
 
 
 # ============================================================== recipes
@@ -136,7 +195,7 @@ def build_recipe(ctx, spec: FaultSpec) -> dict:
     if spec.kind == "cpu":
         return {"type": "cpu_quota", "container": c, "cpu_quota": ctx.docker.state(c)["cpu_quota"]}
     if spec.kind in NETEM_ARGS:
-        return {"type": "netem", "container": c, "helper": NETEM_HELPER, "image": NETEM_IMAGE}
+        return {"type": "netem", "container": c, "helper": netem_helper(c), "image": NETEM_IMAGE}
     if spec.kind == "load":
         # The load generator is a thread of the owning process and dies with it, so the
         # guard and panic have nothing to undo; in-process, undo stops the thread.
@@ -161,8 +220,9 @@ def apply_fault_action(ctx, spec: FaultSpec, recipe: dict, params: dict | None =
     elif spec.kind in NETEM_ARGS:
         if not d.image_present(NETEM_IMAGE):
             raise FaultError(f"{spec.id} needs the {NETEM_IMAGE} image: run `docker pull {NETEM_IMAGE}` first")
-        d.run_helper(NETEM_HELPER, NETEM_IMAGE, c, ["sleep", "600"])
-        d.exec(NETEM_HELPER, ["tc", "qdisc", "add", "dev", "eth0", "root", "netem", *netem_args(spec.kind, params)])
+        helper = recipe["helper"]
+        d.run_helper(helper, NETEM_IMAGE, c, ["sleep", "600"])
+        d.exec(helper, ["tc", "qdisc", "add", "dev", "eth0", "root", "netem", *netem_args(spec.kind, params)])
     elif spec.kind == "load":
         from .load import start_load  # local import avoids a cycle
 
@@ -221,9 +281,9 @@ def verify_recipe(ctx, recipe: dict) -> tuple[bool, str]:
         now = d.state(c)["nano_cpus"] or 0
         return now == int(recipe["nano_cpus"]), f"NanoCpus={now} expected={recipe['nano_cpus']}"
     if kind == "netem":
-        if d.list_helpers():
-            return False, f"helpers still present: {d.list_helpers()}"
-        has = netem_present(ctx)
+        if recipe["helper"] in d.list_helpers():
+            return False, f"helper still present: {recipe['helper']}"
+        has = netem_present(ctx, c)
         return has is not True, "no netem qdisc" if has is False else ("netem check skipped" if has is None else "netem still active")
     if kind == "stop_load":
         from .load import load_running
@@ -282,13 +342,13 @@ def _remove_netem(ctx, recipe: dict) -> None:
     d.remove_helper(helper)
 
 
-def netem_present(ctx) -> bool | None:
-    """True/False if we could check the ML qdisc; None if the netshoot image is absent."""
+def netem_present(ctx, container: str = ML) -> bool | None:
+    """True/False if we could check ``container``'s qdisc; None if the netshoot image is absent."""
     d = ctx.docker
-    if not d.image_present(NETEM_IMAGE) or not d.state(ML)["running"]:
+    if not d.image_present(NETEM_IMAGE) or not d.state(container)["running"]:
         return None
     probe = "shutterstorm_netem_check"
-    d.run_helper(probe, NETEM_IMAGE, ML, ["sleep", "30"])
+    d.run_helper(probe, NETEM_IMAGE, container, ["sleep", "30"])
     try:
         out = d.exec(probe, ["tc", "qdisc", "show", "dev", "eth0"], check=False).stdout
         return "netem" in out

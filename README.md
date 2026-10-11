@@ -55,16 +55,29 @@ User journeys probed: **J0** ping, **J1** login, **J2** browse (DB), **J3** smar
 **J4** upload, **J5** thumbnail generated (async, Redis queue), **J6** SHA-1 of the downloaded original.
 A request that exceeds the 10 s probe timeout counts as **hung**, distinct from a **fast failure**.
 
-### Failure types (fixed catalog; `python -m shutterstorm list`)
+### Failure types: composed by the AI from fault types × discovered targets
 
-| Failure type (hackathon list) | ShutterStorm faults |
-|---|---|
-| Service or container crash | `server_restart`, `ml_stop`, `redis_stop` |
-| Failed / hung dependency | `ml_pause`, `redis_pause`, `db_pause` |
-| Overloaded database / dependency | `db_cpu_throttle`, `ml_cpu_throttle` (CPU quota; AI picks 0.1-1.0 CPU, default 0.25) |
-| Sudden traffic spike | `traffic_spike` (read-only clients against our Immich; AI picks 8-48, default 24) |
-| Slow or lossy network | `ml_latency` (500-5,000 ms), `ml_packet_loss` (5-50 %) via `tc netem` (optional, needs `nicolaka/netshoot`) |
-| Combined failures | `spike_ml_down` (spike + ML down), `spike_redis_hung` (spike + Redis frozen) |
+There is no hand-written fault list. ShutterStorm generates the catalog from **6 fault types** applied to
+every **target service** in the sandbox, plus a traffic spike on the entry point and "traffic spike + X"
+combinations (39 in total; `python -m shutterstorm list`). The AI planner composes each experiment by
+choosing a (fault type, target) pair among the services found in the run's dependency map, then its
+strength, duration and safety limits. Ids are `<target>_<type>` (`redis_cpu_throttle`) and `spike_<id>`.
+
+| Fault type | Targets | Hackathon failure type |
+|---|---|---|
+| `pause` (freeze) | server, db, redis, ml | failed / hung dependency |
+| `stop` | server, redis, ml (db: manual only) | service down |
+| `restart` | server, redis, ml (db: manual only) | container crash |
+| `cpu_throttle` (CPU quota 0.1-1.0) | server, db, redis, ml | overloaded database / service |
+| `latency` (netem 500-5,000 ms) | server, db, redis, ml | slow network |
+| `packet_loss` (netem 5-50 %) | server, db, redis, ml | lossy network |
+| `traffic_spike` (8-48 read-only clients) | entry point | sudden traffic spike |
+| `spike_<fault>` | any non-server, non-manual fault | combined failures |
+
+**Safety policy, enforced in code:** stopping or restarting Postgres is manual-only (the AI never picks
+it); network faults need the `nicolaka/netshoot` image (unavailable otherwise); every action passes the scope
+check; at most 2 experiments per service and per failure class, 1 combination per run. Old ids
+`spike_ml_down` and `spike_redis_hung` still resolve.
 
 Full disk is deliberately **not** injected: filling a disk on a laptop Docker host is not contained to our
 sandbox (Docker Desktop shares one VM disk with everything else).
@@ -202,7 +215,8 @@ trigger them), and the app is served with a strict Content-Security-Policy; run 
 1. **Scope check before every Docker action**: only the four Immich containers (label
    `com.docker.compose.project=immich`) and our own labelled `shutterstorm_*` helpers. The traffic
    generator only talks to `IMMICH_URL` and only sends read-only requests.
-2. **Fixed fault catalog**; anything else is rejected, including by the AI planner's validator.
+2. **Composed, bounded catalog**: the AI composes experiments only from known fault types × sandbox targets;
+   anything else is rejected by the planner's validator and again by the controller.
    Postgres is never killed; `db_stop` and the netem faults are never picked automatically.
 3. **Write-ahead journal**: the undo recipe is written before a fault is applied and removed only after the
    undo is verified. Combined failures get one entry per part.
