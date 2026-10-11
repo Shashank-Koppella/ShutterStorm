@@ -41,7 +41,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from . import webapi
 from .config import CORE_CONTAINERS, Settings
 from .context import build_context
-from .faults import CATALOG
+from .faults import lookup
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 STATIC_TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -220,7 +220,7 @@ def make_handler(settings: Settings, ctx, job: Job):
             sim = ["--simulate"] if settings.simulate else []
             if self.path == "/api/run":
                 fault = body.get("fault")
-                if fault not in CATALOG:
+                if lookup(fault) is None:
                     return self._json({"error": "unknown fault"}, 400)
                 args = ["run", "--experiments", fault, *strict]
                 return self._json({"started": job.start([*sim, *args], " ".join(args), "run")})

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 
-from .faults import CATALOG, FaultSpec
+from .faults import CATALOG, TARGET_NAME, FaultSpec, lookup
 from .llm import LLMClient
 from .probes import JOURNEYS
 from .fixes import KNOBS, ML2_SERVICE, ML_URL_1, ML_URL_2
@@ -87,7 +87,7 @@ def evidence_digest(exp: dict, max_log_lines: int = 40) -> dict:
                 max_waiting[q] = max(max_waiting.get(q, 0), s.get("waiting", 0) + s.get("active", 0))
     return {
         "fault": exp["fault"],
-        "fault_description": CATALOG[exp["fault"]].description,
+        "fault_description": lookup(exp["fault"]).description if lookup(exp["fault"]) else exp["fault"],
         "fault_window_s": exp["window_s"],
         "fault_summary": exp["fault_summary"],
         "recovery_s_after_undo": exp["recovery_s"],
@@ -101,7 +101,7 @@ def evidence_digest(exp: dict, max_log_lines: int = 40) -> dict:
 
 def _ask(llm: LLMClient, instruction: str, payload: dict, check) -> tuple[dict | None, str]:
     messages = [{"role": "system", "content": SYSTEM},
-                {"role": "user", "content": instruction + "\n\nEVIDENCE (JSON):\n" + json.dumps(payload, default=str)[:24000]}]
+                {"role": "user", "content": instruction + "\n\nEVIDENCE (JSON):\n" + json.dumps(payload, default=str, separators=(",", ":"))[:48000]}]
     return llm.complete_json(messages, check)
 
 
@@ -201,6 +201,28 @@ ROOT_CAUSES = {
 }
 
 
+# Generic wording for (target, type) pairs without a hand-written hypothesis (composed faults).
+KIND_CAUSES = {
+    "pause": "A frozen {t} keeps its connections open but never answers, so requests that need it wait until a timeout.",
+    "stop": "With {t} gone, connections are refused; callers either fail fast or retry in the background.",
+    "restart": "While {t} restarts there is no second instance to take over, so its callers fail briefly.",
+    "cpu": "With a CPU limit, {t} processes work more slowly, so journeys that depend on it slow down first.",
+    "latency": "Every call to {t} pays the injected network delay; callers without short timeouts slow down with it.",
+    "loss": "Dropped packets force TCP retransmissions on every call to {t}, so its callers slow down or time out.",
+    "load": "A burst of concurrent clients queues requests in the single API server and its database pool.",
+}
+
+
+def root_cause(spec: FaultSpec) -> str:
+    """Hand-written hypothesis if there is one, else the generic one for the fault type."""
+    part = spec.atomic[-1] if spec.parts else spec
+    known = ROOT_CAUSES.get((spec.service, spec.kind)) or ROOT_CAUSES.get((part.service, part.kind))
+    if known:
+        return known
+    text = KIND_CAUSES.get(part.kind, "unknown").format(t=TARGET_NAME.get(part.service, part.service))
+    return f"Two faults at once: {text} The traffic spike adds load on top." if spec.parts else text
+
+
 def predict(llm: LLMClient, spec: FaultSpec, topology: dict, deterministic: dict) -> dict:
     """Ask the Analyst which journeys will break *before* injecting. Falls back to the map."""
     payload = {"fault": spec.id, "description": spec.description, "target_service": spec.service,
@@ -239,7 +261,7 @@ def analyze(llm: LLMClient, exp: dict, topology: dict) -> dict:
 
 
 def fallback_analysis(exp: dict) -> dict:
-    spec = CATALOG[exp["fault"]]
+    spec = lookup(exp["fault"]) or CATALOG["traffic_spike"]
     cells = exp["heatmap"]
     affected = [j for j, c in cells.items() if c not in ("ok", "n/a")]
     parts = [f"{j} {JOURNEYS[j]}: {cells[j]}" for j in affected]
@@ -255,7 +277,7 @@ def fallback_analysis(exp: dict) -> dict:
         "predicted_impact": ", ".join(exp["prediction"]["predicted_impacted"]),
         "summary": summary,
         "affected_journeys": affected,
-        "root_cause_hypothesis": ROOT_CAUSES.get((spec.service, spec.kind), "unknown"),
+        "root_cause_hypothesis": root_cause(spec),
         "user_visible_symptom": symptom,
         "severity_rationale": (f"score {exp['scoring']['score']}/100, criticality {exp['scoring']['criticality']} "
                                f"x likelihood {exp['scoring']['likelihood']} -> severity {exp['scoring']['severity']}"
@@ -289,13 +311,14 @@ CODE_LEVEL_FIXES = {
 
 def fallback_suggestion(exp: dict) -> dict:
     """Template suggestion per service (no AI)."""
-    if CATALOG[exp["fault"]].service == "ml":
+    service = (lookup(exp["fault"]) or CATALOG["traffic_spike"]).service
+    if service == "ml":
         return {"rationale": "Add a second ML instance and list both URLs so the server can fail over; a short "
                              "availability-check interval lets it notice a frozen or stopped instance quickly.",
                 "patch": _ml_failover_patch(1000, 5000),
                 "expected_effect": "smart search keeps working (served by the second instance) while the first "
                                    "one is paused or down"}
-    return {"no_fix_possible": True, "recommendation": CODE_LEVEL_FIXES[CATALOG[exp["fault"]].service]}
+    return {"no_fix_possible": True, "recommendation": CODE_LEVEL_FIXES[service]}
 
 
 def suggest_fix(llm: LLMClient, exp: dict, current_values: dict) -> dict:
@@ -359,7 +382,7 @@ def fallback_report(items: list[dict], overall: float | None) -> dict:
         findings.append({
             "id": i["id"], "title": f"{i['fault']}: {i['analysis']['user_visible_symptom'][:90]}",
             "severity": i["severity"], "evidence": i["analysis"]["summary"],
-            "fix": i["suggestion"] or CODE_LEVEL_FIXES.get(CATALOG[i["fault"]].service, ""),
+            "fix": i["suggestion"] or CODE_LEVEL_FIXES.get((lookup(i["fault"]) or CATALOG["traffic_spike"]).service, ""),
             "status": "suggested fix (not applied, not tested)",
         })
     recs = ["Add request timeouts on every server->dependency call (ML HTTP, BullMQ enqueue, DB pool) so hangs become "

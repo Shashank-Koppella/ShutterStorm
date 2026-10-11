@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from .checkpoint import load_last_checkpoint
 from .config import CORE_CONTAINERS, Thresholds
-from .faults import NETEM_HELPER, NETEM_IMAGE, FaultSpec, _remove_netem, _restore_cpus, undo_entry
+from .faults import NETEM_IMAGE, FaultSpec, _remove_netem, _restore_cpus, netem_target, undo_entry
 from .load import stop_all as stop_all_load
 from .probes import AssetTracker, percentile
 from .topology import JOURNEY_DEPS
@@ -109,8 +109,9 @@ def panic(ctx, reason: str = "manual") -> dict:
             actions.append(f"started {name}")
 
     for helper in d.list_helpers():
-        if helper == NETEM_HELPER:
-            _remove_netem(ctx, {"helper": helper, "image": NETEM_IMAGE, "container": "immich_machine_learning"})
+        target = netem_target(helper)
+        if target:  # a netem helper: delete the qdisc in its target's network namespace first
+            _remove_netem(ctx, {"helper": helper, "image": NETEM_IMAGE, "container": target})
         else:
             d.remove_helper(helper)
         actions.append(f"removed helper {helper}")

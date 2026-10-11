@@ -60,7 +60,7 @@ def test_protected_journeys_define_the_blast_radius():
     assert protected_journeys(CATALOG["ml_pause"]) == ["J0", "J1", "J2", "J4", "J5", "J6"]
     assert protected_journeys(CATALOG["db_pause"]) == ["J0"]
     assert protected_journeys(CATALOG["server_restart"]) == []
-    assert protected_journeys(CATALOG["spike_redis_hung"]) == ["J0", "J1", "J2", "J3", "J6"]
+    assert protected_journeys(CATALOG["spike_redis_pause"]) == ["J0", "J1", "J2", "J3", "J6"]
 
 
 def test_monitor_needs_consecutive_breaches():
@@ -100,12 +100,12 @@ def test_workflow_rolls_back_on_threshold_breach(ctx):
 
 # ---------------------------------------------------------------------- new faults
 def test_combo_and_traffic_spike_in_workflow(ctx):
-    wf = Workflow(ctx, ["spike_redis_hung", "db_cpu_throttle"])
+    wf = Workflow(ctx, ["spike_redis_hung", "db_cpu_throttle"])  # legacy combo id still accepted
     run_dir = wf.run()
     data = json.loads((run_dir / "findings.json").read_text(encoding="utf-8"))
     assert data["status"] == "completed", data.get("error")
     exps = {e["fault"]: e for e in data["experiments"]}
-    combo = exps["spike_redis_hung"]
+    combo = exps["spike_redis_pause"]
     assert combo["parts"] == ["traffic_spike", "redis_pause"]
     assert combo["load"]["sent"] > 0 and combo["load"]["workers"] == 24
     assert combo["heatmap"]["J4"] == "hung"

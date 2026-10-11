@@ -36,7 +36,7 @@ from pathlib import Path
 
 from .agents import _ask, _need, grounding_errors
 from .config import Thresholds
-from .faults import CATALOG, FAULT_KNOBS, NETEM_ARGS, NETEM_IMAGE, FaultSpec
+from .faults import CATALOG, FAULT_KNOBS, FAULT_TYPES, NETEM_ARGS, NETEM_IMAGE, TARGETS, FaultSpec, get_fault
 from .llm import LLMClient
 from .probes import ALL_JOURNEYS
 from .scoring import CRITICALITY, LIKELIHOOD
@@ -48,6 +48,7 @@ FAILURE_CLASS = {"pause": "hung dependency", "stop": "dependency down", "restart
 HANG_STYLE = {"pause", "latency", "loss"}
 MIN_CLASSES = 3
 MAX_PER_SERVICE = 2
+MAX_PER_CLASS = 2   # with ~40 compositions, keep one failure class from crowding out the rest
 MAX_COMBOS = 1
 DEFAULT_BUDGET = 6
 DURATION_BOUNDS = (15.0, 45.0)        # fault window the AI may choose, seconds
@@ -74,25 +75,42 @@ def run_history(runs_dir: Path, simulate: bool) -> dict[str, dict]:
     return history
 
 
+def map_services(topology: dict) -> set[str]:
+    """Sandbox services that appear in the discovered dependency map (the targets the AI may choose)."""
+    seen = {"server"} | {e.get("to") for e in topology.get("edges", [])} | set(topology.get("nodes", {}))
+    return {s for s in TARGETS if s in seen}
+
+
 def candidates(ctx, topology: dict, history: dict[str, dict]) -> list[dict]:
-    """Every catalog fault with the features the planner reasons about."""
+    """Every composed (fault type, target) pair with the features the planner reasons about.
+
+    Targets come from the discovered dependency map: a pair whose target service is not in the map
+    is unavailable. Safety-policy pairs (manual-only) and network faults without the helper image
+    are listed but unavailable, with the reason."""
     undeclared = " ".join(topology.get("undeclared_dependencies", []))
+    in_map = map_services(topology)
     netem_ok = None
     out = []
     for spec in CATALOG.values():
         available, why = True, ""
         if spec.optional:
-            available, why = False, "optional fault: run it explicitly with --experiments"
+            available, why = False, "safety policy: manual only (run it explicitly with --experiments)"
+        elif not set(spec.services) <= in_map:
+            available, why = False, "target not in the discovered dependency map"
         elif any(p.kind in NETEM_ARGS for p in spec.atomic):
             netem_ok = ctx.docker.image_present(NETEM_IMAGE) if netem_ok is None else netem_ok
             if not netem_ok:
                 available, why = False, f"needs the {NETEM_IMAGE} image"
         predicted = predict_impact(spec, topology)["predicted_impacted"]
         h = history.get(spec.id, {"runs": 0})
+        part = spec.atomic[-1]
         out.append({
             "fault": spec.id,
             "description": spec.description,
             "failure_class": FAILURE_CLASS[spec.kind],
+            "fault_type": part.kind,
+            "target": part.service,
+            "with_traffic_spike": bool(spec.parts),
             "kind": spec.kind,
             "services": list(spec.services),
             "primary_service": spec.service,
@@ -147,6 +165,8 @@ def allowed_next(c: dict, picked: list[dict], budget: int, min_classes: int) -> 
     if sum(p["primary_service"] == c["primary_service"] for p in picked) >= MAX_PER_SERVICE:
         return False
     if c["kind"] == "combo" and sum(p["kind"] == "combo" for p in picked) >= MAX_COMBOS:
+        return False
+    if sum(p["failure_class"] == c["failure_class"] for p in picked) >= MAX_PER_CLASS:
         return False
     classes = {p["failure_class"] for p in picked}
     missing = min_classes - len(classes)
@@ -213,6 +233,9 @@ def check_plan(data: dict, cands: list[dict], budget: int) -> list[str]:
     for service in {allowed[f]["primary_service"] for f in seen}:
         if sum(allowed[f]["primary_service"] == service for f in seen) > MAX_PER_SERVICE:
             errors.append(f"at most {MAX_PER_SERVICE} experiments on {service}")
+    for cls in {allowed[f]["failure_class"] for f in seen}:
+        if sum(allowed[f]["failure_class"] == cls for f in seen) > MAX_PER_CLASS:
+            errors.append(f"at most {MAX_PER_CLASS} experiments of class {cls}")
     return errors
 
 
@@ -236,20 +259,22 @@ def plan_from(llm: LLMClient, topology: dict, cands: list[dict], budget: int = D
         "undeclared_dependencies": topology.get("undeclared_dependencies", []),
         "journeys": {j: deps for j, deps in topology.get("journey_deps", {}).items()},
         "budget": min(budget, sum(c["available"] for c in cands)),
-        "candidates": [{k: c[k] for k in ("fault", "description", "failure_class", "services", "criticality",
-                                          "likelihood", "predicted_impacted", "blast_radius",
-                                          "undeclared_dependency", "hang_style", "history", "priority")}
-                       for c in cands if c["available"]],
+        "fault_types": {k: v[1].format(t="<target>") for k, v in FAULT_TYPES.items()} | {"load": "traffic spike on the entry point"},
+        "targets_in_map": sorted(map_services(topology)),
+        "candidates": [_compact(c) for c in cands if c["available"]],
         "deterministic_suggestion": [p["fault"] for p in fallback],
     }
     instruction = (
-        "You are the experiment Planner of a chaos-engineering tool. Using the dependency map and the candidate "
-        "features, choose which experiments to run and in which order: the most informative or riskiest first. "
+        "You are the experiment Planner of a chaos-engineering tool. Experiments are composed: a fault type "
+        "(freeze, stop, restart, CPU limit, network delay, packet loss, traffic spike) applied to a target service "
+        "found in the dependency map, optionally together with a traffic spike. Every available composition is a "
+        "candidate. Using the dependency map and the candidate features, compose the experiments to run and their "
+        "order: the most informative or riskiest first. "
         "Prefer dependencies that compose does not declare, faults that may fail silently (hangs), high "
         "criticality x likelihood, wide blast radius, and faults that were never tested or were severe before. "
         f"Choose exactly the budget, only fault ids from the candidates, cover at least {MIN_CLASSES} "
         f"different failure classes, every service of the map if the budget allows, at most {MAX_PER_SERVICE} "
-        f"experiments per primary service and at most {MAX_COMBOS} combined failure. You may deviate from "
+        f"experiments per primary service, at most {MAX_PER_CLASS} per failure class and at most {MAX_COMBOS} combined failure. You may deviate from "
         "deterministic_suggestion when you explain why. Schema: "
         "{\"plan\": [{\"fault\": str, \"reason\": str (one sentence that names the dependency or journeys "
         "involved)}], \"strategy\": str (one sentence)}")
@@ -279,7 +304,16 @@ def plan_from(llm: LLMClient, topology: dict, cands: list[dict], budget: int = D
 
 
 def spec_list(p: dict) -> list[FaultSpec]:
-    return [CATALOG[i["fault"]] for i in p["items"]]
+    return [get_fault(i["fault"]) for i in p["items"]]
+
+
+def _compact(c: dict) -> dict:
+    """A candidate as the LLM sees it: the composition and the features that drive the choice."""
+    h = c["history"]
+    return {"fault": c["fault"], "type": c["fault_type"], "target": c["target"], "with_spike": c["with_traffic_spike"],
+            "class": c["failure_class"], "criticality": c["criticality"], "likelihood": c["likelihood"],
+            "predicted": c["predicted_impacted"], "undeclared": c["undeclared_dependency"], "hang": c["hang_style"],
+            "tested": h["runs"], "last_severity": h.get("last_severity"), "priority": c["priority"]}
 
 
 # ====================================================================== how safely: settings
@@ -398,15 +432,16 @@ def decide_next_from(llm: LLMClient, the_plan: dict, done_exps: list[dict], caps
         return None
     remaining_plan = [i for i in the_plan["items"] if i["fault"] not in {f["fault"] for f in done}]
     fallback = deterministic_next(cands, remaining_plan, done, budget)
-    bounds = {c["fault"]: {k: {"default": v[0], "min": v[1], "max": v[2]}
-                           for k, v in setting_bounds(CATALOG[c["fault"]], caps, max_fault_s, default_window).items()}
-              for c in pool}
+    common = {k: {"default": v[0], "min": v[1], "max": v[2]}
+              for k, v in setting_bounds(CATALOG["db_pause"], caps, max_fault_s, default_window).items()}
+    bounds = {"every_fault": common,
+              "strength_by_fault_type": {kind: {"setting": n, "default": d, "min": lo, "max": hi}
+                                         for kind, (n, d, lo, hi) in FAULT_KNOBS.items()}}
     payload = {
         "step": len(done) + 1, "budget": budget,
         "observed_so_far_in_this_run": done,
         "tentative_plan_remaining": [{"fault": i["fault"], "reason": i["reason"]} for i in remaining_plan],
-        "allowed_next": [{k: c[k] for k in ("fault", "description", "failure_class", "services", "criticality",
-                                            "predicted_impacted", "hang_style", "priority")} for c in pool],
+        "allowed_next": [_compact(c) for c in pool],
         "settings_bounds": bounds,
         "safety_rules": "max_error_rate and max_p95_ms are CAPS: you may only choose stricter (lower) values. "
                         "Blast-radius checking, the 60 s TTL and the guard always apply.",
@@ -417,8 +452,9 @@ def decide_next_from(llm: LLMClient, the_plan: dict, done_exps: list[dict], caps
         "in progress. Use what was observed so far in this run: dig deeper where something broke unexpectedly or "
         "hung, avoid repeating what is already clear, keep covering failure classes. Decide (1) WHAT: one fault id "
         "from allowed_next (you may change the tentative plan), (2) HOW HARD and HOW LONG: settings within "
-        "settings_bounds for that fault (duration_s, plus its strength setting if settings_bounds lists one: cpus, "
-        "workers, delay_ms or loss_pct), and (3) HOW SAFELY: "
+        "settings_bounds (duration_s from every_fault, plus the strength setting of the fault's type from "
+        "strength_by_fault_type: cpus, workers, delay_ms or loss_pct; a traffic-spike combination may also set "
+        "workers), and (3) HOW SAFELY: "
         "max_error_rate and max_p95_ms, stricter for risky targets (e.g. the database, or a service that already "
         "hung) and never above their max. Schema: {\"fault\": str, \"reason\": str (one sentence: why this "
         "experiment now, citing what was observed), \"settings\": {\"duration_s\": number, \"max_error_rate\": "
@@ -431,12 +467,12 @@ def decide_next_from(llm: LLMClient, the_plan: dict, done_exps: list[dict], caps
     if data is None:
         if fallback is None:
             return None
-        spec = CATALOG[fallback["fault"]]
+        spec = get_fault(fallback["fault"])
         decision = {"fault": fallback["fault"], "reason": fallback["reason"], "source": "fallback",
                     "safety_reason": "default strength and the configured safety limits (no valid AI decision)",
                     **decide_settings(spec, None, caps, max_fault_s, "default", default_window)}
     else:
-        spec = CATALOG[data["fault"]]
+        spec = get_fault(data["fault"])
         decision = {"fault": data["fault"], "reason": data["reason"].strip(), "source": source,
                     "safety_reason": data["safety_reason"].strip(),
                     **decide_settings(spec, data.get("settings"), caps, max_fault_s, source, default_window)}

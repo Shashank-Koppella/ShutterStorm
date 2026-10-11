@@ -57,7 +57,7 @@ flowchart LR
 ## How the AI decides, and what keeps it safe
 | Decision | Who decides | Enforced by the controller (never by the prompt) |
 |---|---|---|
-| **What** to break | Planner, from map features: criticality, likelihood, blast radius, undeclared dependency, hang style, history, results of this run | catalog faults only; ≥ 3 failure classes, ≤ 2 per service, ≤ 1 combo; invalid → deterministic choice |
+| **What** to break | Planner composes a (fault type, target) pair from the services in the dependency map, using map features: criticality, likelihood, blast radius, undeclared dependency, hang style, history, results of this run | only known fault types × sandbox targets; Postgres stop/restart manual-only; ≥ 3 failure classes, ≤ 2 per service and per class, ≤ 1 combo; invalid → deterministic choice |
 | **When** (order, adapting) | Planner, before every experiment; may change its own plan | the choice must be allowed next under the same rules |
 | **How hard / how long** | Planner: CPU 0.1-1.0, clients 8-48, delay 500-5,000 ms, loss 5-50 %, 15-45 s | values clamped to these bounds, unknown settings ignored |
 | **How safely** | Planner: error-rate and p95 limits per experiment | **stricter-only**: never above the caps (75 %, 8 s); blast radius, TTL, guard always on |
@@ -87,7 +87,7 @@ integrity, recovery (1 at ≤30 s → 0 at 300 s), bounded failure (fast vs hung
 `severity = (100 − S_e)/100 × criticality × likelihood`. Overall = criticality-weighted mean of `S_e`.
 
 ## Safety layers
-Scope check on every docker action · fixed catalog · write-ahead journal with verified undo · threshold
+Scope check on every docker action · composed catalog (fault types × sandbox targets, safety policy) · write-ahead journal with verified undo · threshold
 monitor with AI-chosen, stricter-only limits · 60 s TTL · dead-man guard (process or container, heartbeat) ·
 Ctrl+C / `panic` / `stop` · abort if liveness fails > 30 s after an undo · no fix ever applied · cleanup
 verification in every report · AI isolated from Docker and Immich in container mode.

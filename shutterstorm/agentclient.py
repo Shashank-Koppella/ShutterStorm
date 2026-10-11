@@ -26,7 +26,7 @@ import requests
 from . import agents as agent_fns
 from . import planner
 from .config import Settings, Thresholds
-from .faults import CATALOG
+from .faults import get_fault
 from .llm import LLMClient
 from .probes import JOURNEYS
 
@@ -45,7 +45,7 @@ def _decide_next(llm, the_plan, done_exps, caps, budget, max_fault_s, default_wi
 
 
 def _predict(llm, fault, topology, deterministic):
-    return agent_fns.predict(llm, CATALOG[fault], topology, deterministic)
+    return agent_fns.predict(llm, get_fault(fault), topology, deterministic)
 
 
 def _analyze(llm, exp, topology):
@@ -153,7 +153,7 @@ class Agents:
             d = {**d, "fault": nxt["fault"], "reason": nxt["reason"], "source": "fallback", "settings": {},
                  "safety_reason": "default strength and the configured safety limits"}
         # Re-clamp on the controller: the agent's own clamping is not trusted.
-        final = planner.decide_settings(CATALOG[d["fault"]], d.get("settings"), caps, max_fault_s,
+        final = planner.decide_settings(get_fault(d["fault"]), d.get("settings"), caps, max_fault_s,
                                         d.get("settings_source", d.get("source", "default")), default_window)
         final["clamped"] = list(dict.fromkeys((d.get("clamped") or []) + final["clamped"]))
         return {**d, **final}

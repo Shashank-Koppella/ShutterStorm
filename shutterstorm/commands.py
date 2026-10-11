@@ -386,11 +386,15 @@ def cmd_list(settings: Settings, args: Namespace) -> int:
     from .faults import CATALOG, DEFAULT_EXPERIMENTS
     from .fixes import KNOBS
 
-    print("Fault catalog (anything else is rejected):")
+    from .faults import ALIASES, FAULT_TYPES, TARGETS
+
+    print(f"Fault catalog: {len(FAULT_TYPES)} fault types x {len(TARGETS)} targets, a traffic spike and "
+          "'traffic spike + X' combinations (anything else is rejected):")
     for f in CATALOG.values():
-        tag = "combo" if f.parts else ("optional" if f.optional else "")
-        print(f"  {f.id:<17} {f.container:<25} {f.kind:<8} likelihood {f.likelihood}  {tag:<8} {f.description}"
-              + (f"  [= {' + '.join(f.parts)}]" if f.parts else ""))
+        tag = "combo" if f.parts else ("manual" if f.optional else "")
+        print(f"  {f.id:<26} {f.container:<25} {f.kind:<8} likelihood {f.likelihood}  {tag:<6} {f.description}")
+    print("\nmanual = safety policy: never chosen by the AI planner, only on explicit request")
+    print("Legacy ids still accepted: " + ", ".join(f"{a} -> {b}" for a, b in ALIASES.items()))
     print("\nThe AI planner chooses among the non-optional faults; `run --no-plan` uses: "
           + ", ".join(DEFAULT_EXPERIMENTS))
     print("\nSettings a fix suggestion may use (anything else is flagged; ShutterStorm never applies fixes):")
